@@ -14,7 +14,7 @@ VastNova is a lightweight, statically typed programming language that compiles d
 Clone the repository and run the build script:
 
 ```bash
-git clone https://github.com/sodous-s/vastnova.git
+git clone https://github.com/VastNova-lang/vastnova.git
 cd vastnova
 ./build.sh
 ```
