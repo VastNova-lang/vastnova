@@ -1,0 +1,36 @@
+// Demonstrates while loop, break, and continue
+print("Counting from 0 to 4:")
+var i = 0
+while i < 5 {
+    print(i)
+    i = i + 1
+}
+
+print("Skipping 3 using continue:")
+i = 0
+while i < 5 {
+    i = i + 1
+    if i == 3 {
+        continue   // skip printing 3
+    }
+    print(i)
+}
+
+print("Breaking at 7:")
+i = 0
+while i < 10 {
+    i = i + 1
+    if i == 7 {
+        break      // stop loop
+    }
+    print(i)
+}
+
+// Sum of numbers until user enters 0
+var sum = 0
+var num = int(input("Enter a number (0 to stop): "))
+while num != 0 {
+    sum = sum + num
+    num = int(input("Next number: "))
+}
+print("Sum =", sum)

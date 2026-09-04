@@ -1,6 +1,31 @@
+// Demonstrates if/else and comparison operators
 var score = int(input("Enter your score: "))
-if score >= 60 {
+
+if score >= 90 {
+    print("Excellent!")
+} else if score >= 60 {
     print("Pass")
 } else {
     print("Fail")
+}
+
+// Nested if with logical operators
+var age = int(input("Enter your age: "))
+if age >= 18 {
+    print("You are an adult.")
+    if age >= 65 {
+        print("You are a senior citizen.")
+    }
+} else {
+    print("You are a minor.")
+}
+
+// Logical operators
+var x = 5
+var y = 10
+if x > 0 && y < 20 {
+    print("Both conditions are true")
+}
+if x == 5 || y == 5 {
+    print("At least one condition is true")
 }

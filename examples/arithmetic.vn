@@ -1,10 +1,21 @@
+// Demonstrates arithmetic operations with integers and floats
 var a = 10
 var b = 20
+var c = 3.14
+
+print("a =", a, "b =", b, "c =", c)
+
+// Integer arithmetic
 var sum = a + b
 var product = a * b
-var quotient = b / a
+var quotient = b / a   // integer division (truncates)
 var diff = b - a
-print("sum =", sum)
-print("product =", product)
-print("quotient =", quotient)
-print("diff =", diff)
+print("sum =", sum, "product =", product, "quotient =", quotient, "diff =", diff)
+
+// Mixed arithmetic (integer and float)
+var mixed = a + b * 2 - c / 3
+print("mixed =", mixed)  // result is float because c is float
+
+// Parentheses override precedence
+var with_parens = (a + b) * 2
+print("with parentheses =", with_parens)

@@ -1,0 +1,28 @@
+// Demonstrates type conversion functions: str(), int(), float()
+// Converting numbers to strings
+var num = 123
+var pi = 3.14159
+var num_str = str(num)   // "123"
+var pi_str = str(pi)     // "3.14159"
+
+var msg = "The number is " + num_str + " and pi is " + pi_str
+print(msg)
+
+// Converting strings to numbers (from input)
+var age_str = input("Enter your age: ")
+var age = int(age_str)          // convert to i32
+print("Next year you will be", age + 1)
+
+var weight_str = input("Enter your weight in kg: ")
+var weight = float(weight_str)  // convert to f64
+print("Your weight is", weight, "kg")
+
+// Converting between numeric types
+var x = 42
+var y = float(x)       // 42.0
+var z = int(3.99)      // 3 (truncates)
+print("x =", x, "y =", y, "z =", z)
+
+// Mixing with arithmetic
+var result = int(3.14) + 5
+print("int(3.14) + 5 =", result)

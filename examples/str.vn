@@ -1,6 +1,0 @@
-var pi = 3.14159
-var num = 42
-var pi_str = str(pi)
-var num_str = str(num)
-var msg = "Pi is " + pi_str + ", and the answer is " + num_str
-print(msg)

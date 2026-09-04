@@ -1,3 +1,13 @@
+// Demonstrates input/output with prompts
 var name = input("What is your name? ")
-var age = input("How old are you? ")
-print("Hello,", name, "you are", age, "years old.")
+var age_str = input("How old are you? ")
+var age = int(age_str)
+
+print("Hello,", name, "! You are", age, "years old.")
+
+// Input without prompt
+var secret = input()
+print("You entered:", secret)
+
+// Multi-argument print
+print("Next year you will be", age + 1, "years old.")
