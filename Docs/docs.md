@@ -199,7 +199,49 @@ x = "text"      // ERROR: type mismatch (i32 vs str)
 
 Constants (`let`) cannot be reassigned.
 
-## 11. Complete Example Program
+## 11. Modules and Imports
+
+VastNova supports a simple module system via the `import` statement.
+
+### Syntax
+```vastnova
+import "path/to/file.vn"
+```
+
+The path can be relative or absolute. The compiler searches for the file in the following order:
+
+1. If the `VASTNOVA_STD` environment variable is set, it looks for the file under that directory first.
+2. Otherwise, it looks for `std/` in the current working directory.
+3. Finally, it looks for the file as given (relative to the current working directory or absolute path).
+
+Duplicate imports are ignored – each file is loaded only once.
+
+### Example: Using Boolean Constants
+Create `std/bool.vn`:
+```vastnova
+let true = 1
+let false = 0
+```
+
+Then use it in your program:
+```vastnova
+import "bool.vn"
+
+var flag = true
+if flag == true {
+    print("It's true!")
+}
+```
+
+### Setting the Standard Library Path
+You can set the `VASTNOVA_STD` environment variable to point to your standard library directory:
+```bash
+export VASTNOVA_STD=/path/to/std
+```
+
+If not set, the compiler falls back to `./std/`.
+
+## 12. Complete Example Program
 
 Below is a full program that uses almost every feature:
 
@@ -237,13 +279,15 @@ while i < 5 {
 }
 ```
 
-## 12. Errors and Limitations
+## 13. Errors and Limitations
 
 - No arrays or dictionaries yet.
 - No user‑defined functions.
 - No explicit type casting except `str()`, `int()`, `float()`.
 - All `if`/`else` and `while` blocks must use `{ }`; no single‑line shorthand.
+- `break` and `continue` can only appear inside loops.
+- Imported files are loaded at compile time; no dynamic imports.
 
-## 13. Further Reading
+## 14. Further Reading
 
-For compiler internals, please check the project source code.
+For compiler internals and contribution guide, check the project's main documentation.

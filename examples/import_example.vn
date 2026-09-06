@@ -1,0 +1,22 @@
+// Import bool constants from standard library
+import "bool.vn"
+
+var flag = true
+if flag {
+    print("Flag is true")
+} else {
+    print("Flag is false")
+}
+
+// Using false
+var done = false
+while done == false {
+    var ans = input("Continue? (y/n): ")
+    if ans == "y" {
+        done = true
+    }
+}
+if done {
+    print("This will not run here")
+}
+print("Loop ended.")

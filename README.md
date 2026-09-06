@@ -21,6 +21,16 @@ cd vastnova
 
 This produces the `vastnova` executable in the project root.
 
+### Setting the Standard Library
+
+VastNova uses an optional standard library for common definitions (e.g., `bool.vn`). By default, the compiler looks for a `std/` directory in the current working directory. To use a custom location, set the `VASTNOVA_STD` environment variable:
+
+```bash
+export VASTNOVA_STD=/path/to/your/std
+```
+
+If not set, the compiler will fall back to `./std/` relative to the current directory.
+
 ### Compile and Run a Program
 Create a file `hello.vn`:
 
