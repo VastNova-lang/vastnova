@@ -217,7 +217,7 @@ The path can be relative or absolute. The compiler searches for the file in the 
 Duplicate imports are ignored – each file is loaded only once.
 
 ### Example: Using Boolean Constants
-Create `std/bool.vn`:
+We have `std/bool.vn`:
 ```vastnova
 let true = 1
 let false = 0
@@ -232,14 +232,6 @@ if flag == true {
     print("It's true!")
 }
 ```
-
-### Setting the Standard Library Path
-You can set the `VASTNOVA_STD` environment variable to point to your standard library directory:
-```bash
-export VASTNOVA_STD=/path/to/std
-```
-
-If not set, the compiler falls back to `./std/`.
 
 ## 12. Complete Example Program
 
