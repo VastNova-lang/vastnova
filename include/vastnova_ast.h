@@ -22,7 +22,8 @@ enum class NodeType {
     StringLit,
     Variable,
     BinaryOp,
-    Call
+    Call,
+    ImportStmt
 };
 
 struct ASTNode {
@@ -114,6 +115,11 @@ struct Call : ASTNode {
     std::string name;
     std::vector<std::unique_ptr<ASTNode>> args;
     Call(const std::string& n) : ASTNode(NodeType::Call), name(n) {}
+};
+
+struct ImportStmt : ASTNode {
+    std::string path;
+    ImportStmt() : ASTNode(NodeType::ImportStmt) {}
 };
 
 } // namespace vastnova

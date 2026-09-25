@@ -1,5 +1,5 @@
 // Import bool constants from standard library
-import "bool.vn"
+import "std/bool.vn"
 
 var flag = true
 if flag {

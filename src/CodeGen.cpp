@@ -27,6 +27,7 @@ class LLVMCodeGen {
     std::map<std::string, llvm::AllocaInst*> varMap;
     std::map<std::string, llvm::Constant*> constMap;
     std::vector<std::pair<llvm::BasicBlock*, llvm::BasicBlock*>> loopStack;
+
 public:
     LLVMCodeGen() : module(std::make_unique<llvm::Module>("vastnova", context)),
                     builder(std::make_unique<llvm::IRBuilder<>>(context)) {}

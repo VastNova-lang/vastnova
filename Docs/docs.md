@@ -111,14 +111,16 @@ Conditions can use comparison operators `>`, `<`, `>=`, `<=`, `==`, `!=` and log
 var score = int(input("Enter your score: "))
 if score >= 90 {
     print("Excellent")
-} else if score >= 60 {
-    print("Pass")
 } else {
-    print("Fail")
+    if score >= 60 {
+        print("Pass")
+    } else {
+        print("Fail")
+    }
 }
 ```
 
-Both `then` and `else` blocks **must** be enclosed in `{ }`, even for a single statement.
+Both `then` and `else` blocks **must** be enclosed in `{ }`, even for a single statement. There is no `else if` shortcut; use nested `if` inside an `else` block instead.
 
 ## 8. Loops: `while`
 
@@ -208,24 +210,26 @@ VastNova supports a simple module system via the `import` statement.
 import "path/to/file.vn"
 ```
 
-The path can be relative or absolute. The compiler searches for the file in the following order:
+Paths are resolved relative to the directory of the file containing the `import` statement. If the file is not found there, the compiler falls back to the current working directory. Absolute paths are used as-is.
 
-1. If the `VASTNOVA_STD` environment variable is set, it looks for the file under that directory first.
-2. Otherwise, it looks for `std/` in the current working directory.
-3. Finally, it looks for the file as given (relative to the current working directory or absolute path).
+Duplicate imports are ignored – each file is loaded only once, and circular imports are safely handled.
 
-Duplicate imports are ignored – each file is loaded only once.
+The standard library lives under `std/` in the project root and is imported by path:
+
+```vastnova
+import "std/bool.vn"
+```
 
 ### Example: Using Boolean Constants
-We have `std/bool.vn`:
+`std/bool.vn`:
 ```vastnova
 let true = 1
 let false = 0
 ```
 
-Then use it in your program:
+Program:
 ```vastnova
-import "bool.vn"
+import "std/bool.vn"
 
 var flag = true
 if flag == true {
@@ -277,9 +281,11 @@ while i < 5 {
 - No user‑defined functions.
 - No explicit type casting except `str()`, `int()`, `float()`.
 - All `if`/`else` and `while` blocks must use `{ }`; no single‑line shorthand.
+- No `else if` shortcut – nest `if` inside `else`.
+- String comparison only supports `==` and `!=`; `>`, `<`, `>=`, `<=` on strings are compile errors.
 - `break` and `continue` can only appear inside loops.
 - Imported files are loaded at compile time; no dynamic imports.
 
 ## 14. Further Reading
 
-For compiler internals and contribution guide, check the project's main documentation.
+For compiler internals, see the source code in the [`src/`](src/) and [`include/`](include/) directories.

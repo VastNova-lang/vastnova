@@ -9,15 +9,10 @@
 #include <stdexcept>
 #include <sstream>
 #include <fstream>
-#include <unordered_set>
+#include <set>
 #include <filesystem>
-#include <cstdlib>
-
-namespace fs = std::filesystem;
 
 namespace vastnova {
-
-extern std::string g_stdDir;
 
 struct Token {
     enum Type {
@@ -78,10 +73,10 @@ public:
                 }
                 if (ident == "var" || ident == "let" || ident == "if" || ident == "else" ||
                     ident == "while" || ident == "break" || ident == "continue" ||
+                    ident == "import" ||
                     ident == "print" || ident == "i32" || ident == "i64" ||
                     ident == "f32" || ident == "f64" || ident == "str" ||
-                    ident == "input" || ident == "int" || ident == "float" ||
-                    ident == "import") {
+                    ident == "input" || ident == "int" || ident == "float") {
                     tokens.emplace_back(Token::Keyword, ident);
                 } else {
                     tokens.emplace_back(Token::Ident, ident);
@@ -114,7 +109,6 @@ public:
                 continue;
             }
 
-            // Multi-character symbols
             if (c == '=' && i + 1 < src.size() && src[i+1] == '=') {
                 tokens.emplace_back(Token::Symbol, "==");
                 i += 2;
@@ -146,7 +140,6 @@ public:
                 continue;
             }
 
-            // Single-character symbols
             if (c == '+' || c == '-' || c == '*' || c == '/' || c == '(' || c == ')' ||
                 c == '{' || c == '}' || c == '[' || c == ']' || c == ':' || c == ';' ||
                 c == ',' || c == '.' || c == '<' || c == '>' || c == '=' || c == '?' ||
@@ -167,8 +160,6 @@ public:
 class Parser {
     std::vector<Token> tokens;
     size_t idx = 0;
-    std::unordered_set<std::string> importedFiles;
-    Program* currentProgram = nullptr;
 
     Token current() const { return tokens[idx]; }
     void advance() { if (idx < tokens.size()) idx++; }
@@ -193,54 +184,6 @@ class Parser {
     std::unique_ptr<ASTNode> parseCondition();
     std::unique_ptr<ASTNode> parseStatement();
     std::unique_ptr<Block> parseBlock();
-
-    std::unique_ptr<Program> loadAndParseFile(const std::string& path) {
-        std::vector<std::string> searchPaths;
-        // 1. User-defined via global variable
-        if (!g_stdDir.empty()) {
-            searchPaths.push_back(g_stdDir + "/" + path);
-        }
-        // 2. Current working directory's std/
-        searchPaths.push_back("std/" + path);
-        // 3. Direct path (relative or absolute)
-        searchPaths.push_back(path);
-
-        fs::path foundPath;
-        bool found = false;
-        for (const auto& tryPath : searchPaths) {
-            if (fs::exists(tryPath)) {
-                foundPath = tryPath;
-                found = true;
-                break;
-            }
-        }
-
-        if (!found) {
-            throw std::runtime_error("Import file not found: " + path);
-        }
-
-        std::string canonical = fs::canonical(foundPath).string();
-        if (importedFiles.count(canonical)) {
-            return std::make_unique<Program>();
-        }
-        importedFiles.insert(canonical);
-
-        std::ifstream in(foundPath);
-        if (!in.is_open()) {
-            throw std::runtime_error("Cannot open import file: " + path);
-        }
-        std::string code((std::istreambuf_iterator<char>(in)),
-                         std::istreambuf_iterator<char>());
-        in.close();
-
-        Tokenizer tokenizer(code);
-        auto tokens = tokenizer.tokenize();
-        Parser parser(tokens);
-        parser.importedFiles = this->importedFiles;
-        auto importedProg = parser.parseProgram();
-        this->importedFiles = parser.importedFiles;
-        return importedProg;
-    }
 
 public:
     Parser(const std::vector<Token>& t) : tokens(t) {}
@@ -359,10 +302,7 @@ std::unique_ptr<Block> Parser::parseBlock() {
     if (!matchSymbol("{")) throw std::runtime_error("Expected '{'");
     auto block = std::make_unique<Block>();
     while (!(current().type == Token::Symbol && current().value == "}") && current().type != Token::Eof) {
-        auto stmt = parseStatement();
-        if (stmt) {
-            block->statements.push_back(std::move(stmt));
-        }
+        block->statements.push_back(parseStatement());
     }
     if (!matchSymbol("}")) throw std::runtime_error("Expected '}'");
     return block;
@@ -370,6 +310,16 @@ std::unique_ptr<Block> Parser::parseBlock() {
 
 std::unique_ptr<ASTNode> Parser::parseStatement() {
     Token tok = current();
+    if (tok.type == Token::Keyword && tok.value == "import") {
+        advance();
+        if (current().type != Token::String) {
+            throw std::runtime_error("Expected string literal after 'import'");
+        }
+        auto imp = std::make_unique<ImportStmt>();
+        imp->path = current().value;
+        advance();
+        return imp;
+    }
     if (tok.type == Token::Keyword && tok.value == "var") {
         advance();
         if (current().type != Token::Ident) throw std::runtime_error("Expected variable name after 'var'");
@@ -443,20 +393,6 @@ std::unique_ptr<ASTNode> Parser::parseStatement() {
         }
         return printStmt;
     }
-    if (tok.type == Token::Keyword && tok.value == "import") {
-        advance();
-        if (current().type != Token::String) throw std::runtime_error("Expected string literal after import");
-        std::string path = current().value;
-        advance();
-
-        auto importedProg = loadAndParseFile(path);
-        if (importedProg && currentProgram) {
-            for (auto& stmt : importedProg->statements) {
-                currentProgram->statements.push_back(std::move(stmt));
-            }
-        }
-        return nullptr;
-    }
     if (tok.type == Token::Ident) {
         std::string name = tok.value;
         advance();
@@ -474,21 +410,81 @@ std::unique_ptr<ASTNode> Parser::parseStatement() {
 
 std::unique_ptr<Program> Parser::parseProgram() {
     auto prog = std::make_unique<Program>();
-    currentProgram = prog.get();
     while (current().type != Token::Eof) {
-        auto stmt = parseStatement();
-        if (stmt) {
-            prog->statements.push_back(std::move(stmt));
-        }
+        prog->statements.push_back(parseStatement());
     }
     return prog;
 }
 
-std::unique_ptr<Program> parse(const std::string& code) {
+// -------- Import handling --------
+
+inline std::string resolveImportPath(const std::string& importPath,
+                                     const std::string& currentFile) {
+    namespace fs = std::filesystem;
+
+    // Relative to the current source file's directory.
+    if (!currentFile.empty()) {
+        fs::path p = fs::path(currentFile).parent_path() / importPath;
+        if (fs::exists(p)) return fs::absolute(p).string();
+    }
+
+    // Relative to the working directory.
+    if (fs::exists(importPath)) return fs::absolute(importPath).string();
+
+    throw std::runtime_error("Cannot find import file: " + importPath);
+}
+
+std::unique_ptr<Program> parse(const std::string& code,
+                               const std::string& basePath,
+                               std::set<std::string>& importedFiles);
+
+inline void processImports(Program& prog,
+                           const std::string& basePath,
+                           std::set<std::string>& importedFiles) {
+    std::vector<std::unique_ptr<ASTNode>> newStatements;
+
+    for (auto& stmt : prog.statements) {
+        if (stmt->type == NodeType::ImportStmt) {
+            auto* imp = static_cast<ImportStmt*>(stmt.get());
+            std::string resolved = resolveImportPath(imp->path, basePath);
+
+            if (importedFiles.count(resolved)) continue;
+            importedFiles.insert(resolved);
+
+            std::ifstream in(resolved);
+            if (!in.is_open()) {
+                throw std::runtime_error("Cannot open import file: " + resolved);
+            }
+            std::string code((std::istreambuf_iterator<char>(in)),
+                             std::istreambuf_iterator<char>());
+            in.close();
+
+            auto importedProg = parse(code, resolved, importedFiles);
+            for (auto& s : importedProg->statements) {
+                newStatements.push_back(std::move(s));
+            }
+        } else {
+            newStatements.push_back(std::move(stmt));
+        }
+    }
+    prog.statements = std::move(newStatements);
+}
+
+std::unique_ptr<Program> parse(const std::string& code,
+                               const std::string& basePath,
+                               std::set<std::string>& importedFiles) {
     Tokenizer tokenizer(code);
     auto tokens = tokenizer.tokenize();
     Parser parser(tokens);
-    return parser.parseProgram();
+    auto prog = parser.parseProgram();
+    processImports(*prog, basePath, importedFiles);
+    return prog;
+}
+
+inline std::unique_ptr<Program> parse(const std::string& code,
+                                      const std::string& basePath = "") {
+    std::set<std::string> imported;
+    return parse(code, basePath, imported);
 }
 
 void printAST(const ASTNode* node, int indent = 0) {
@@ -498,6 +494,11 @@ void printAST(const ASTNode* node, int indent = 0) {
             auto p = static_cast<const Program*>(node);
             std::cout << prefix << "Program\n";
             for (auto& stmt : p->statements) printAST(stmt.get(), indent + 1);
+            break;
+        }
+        case NodeType::ImportStmt: {
+            auto imp = static_cast<const ImportStmt*>(node);
+            std::cout << prefix << "Import: \"" << imp->path << "\"\n";
             break;
         }
         case NodeType::VarDecl: {
