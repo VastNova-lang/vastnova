@@ -73,7 +73,7 @@ public:
                 }
                 if (ident == "var" || ident == "let" || ident == "if" || ident == "else" ||
                     ident == "while" || ident == "break" || ident == "continue" ||
-                    ident == "import" ||
+                    ident == "import" || ident == "fn" ||
                     ident == "print" || ident == "i32" || ident == "i64" ||
                     ident == "f32" || ident == "f64" || ident == "str" ||
                     ident == "input" || ident == "int" || ident == "float") {
@@ -212,9 +212,21 @@ std::unique_ptr<ASTNode> Parser::parsePrimary() {
         return str;
     }
     if (tok.type == Token::Ident) {
-        auto var = std::make_unique<Variable>(tok.value);
+        std::string name = tok.value;
         advance();
-        return var;
+        if (matchSymbol("(")) {
+            auto call = std::make_unique<Call>(name);
+            if (!matchSymbol(")")) {
+                while (true) {
+                    call->args.push_back(parseExpression());
+                    if (matchSymbol(",")) continue;
+                    if (matchSymbol(")")) break;
+                    throw std::runtime_error("Expected ',' or ')' in call arguments");
+                }
+            }
+            return call;
+        }
+        return std::make_unique<Variable>(name);
     }
     if (matchSymbol("(")) {
         auto expr = parseExpression();
@@ -320,6 +332,20 @@ std::unique_ptr<ASTNode> Parser::parseStatement() {
         advance();
         return imp;
     }
+    if (tok.type == Token::Keyword && tok.value == "fn") {
+        advance();
+        if (current().type != Token::Ident)
+            throw std::runtime_error("Expected function name after 'fn'");
+        auto fn = std::make_unique<FunctionDecl>();
+        fn->name = current().value;
+        advance();
+        if (!matchSymbol("("))
+            throw std::runtime_error("Expected '(' after function name");
+        if (!matchSymbol(")"))
+            throw std::runtime_error("Parameters are not supported yet");
+        fn->body = parseBlock();
+        return fn;
+    }
     if (tok.type == Token::Keyword && tok.value == "var") {
         advance();
         if (current().type != Token::Ident) throw std::runtime_error("Expected variable name after 'var'");
@@ -401,6 +427,11 @@ std::unique_ptr<ASTNode> Parser::parseStatement() {
             assign->name = name;
             assign->value = parseExpression();
             return assign;
+        } else if (matchSymbol("(")) {
+            auto call = std::make_unique<Call>(name);
+            if (!matchSymbol(")"))
+                throw std::runtime_error("Parameters are not supported yet");
+            return call;
         } else {
             throw std::runtime_error("Unexpected identifier in statement, maybe missing '='?");
         }
@@ -416,19 +447,15 @@ std::unique_ptr<Program> Parser::parseProgram() {
     return prog;
 }
 
-// -------- Import handling --------
-
 inline std::string resolveImportPath(const std::string& importPath,
                                      const std::string& currentFile) {
     namespace fs = std::filesystem;
 
-    // Relative to the current source file's directory.
     if (!currentFile.empty()) {
         fs::path p = fs::path(currentFile).parent_path() / importPath;
         if (fs::exists(p)) return fs::absolute(p).string();
     }
-
-    // Relative to the working directory.
+    
     if (fs::exists(importPath)) return fs::absolute(importPath).string();
 
     throw std::runtime_error("Cannot find import file: " + importPath);
@@ -494,6 +521,12 @@ void printAST(const ASTNode* node, int indent = 0) {
             auto p = static_cast<const Program*>(node);
             std::cout << prefix << "Program\n";
             for (auto& stmt : p->statements) printAST(stmt.get(), indent + 1);
+            break;
+        }
+        case NodeType::FunctionDecl: {
+            auto f = static_cast<const FunctionDecl*>(node);
+            std::cout << prefix << "Function: " << f->name << "()\n";
+            printAST(f->body.get(), indent + 1);
             break;
         }
         case NodeType::ImportStmt: {

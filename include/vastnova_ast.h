@@ -9,6 +9,7 @@ namespace vastnova {
 
 enum class NodeType {
     Program,
+    FunctionDecl,
     VarDecl,
     ConstDecl,
     Assign,
@@ -35,6 +36,12 @@ struct ASTNode {
 struct Program : ASTNode {
     std::vector<std::unique_ptr<ASTNode>> statements;
     Program() : ASTNode(NodeType::Program) {}
+};
+
+struct FunctionDecl : ASTNode {
+    std::string name;
+    std::unique_ptr<ASTNode> body;
+    FunctionDecl() : ASTNode(NodeType::FunctionDecl) {}
 };
 
 struct VarDecl : ASTNode {

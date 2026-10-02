@@ -37,6 +37,24 @@ public:
             llvm::Type::getInt32Ty(context), false);
         mainFunc = llvm::Function::Create(mainType, llvm::Function::ExternalLinkage,
                                           "main", module.get());
+        std::vector<const FunctionDecl*> funcs;
+        std::vector<const ASTNode*> mainStmts;
+        for (auto& s : prog.statements) {
+            if (s->type == NodeType::FunctionDecl)
+                funcs.push_back(static_cast<const FunctionDecl*>(s.get()));
+            else
+                mainStmts.push_back(s.get());
+        }
+
+        llvm::Type* voidTy = llvm::Type::getVoidTy(context);
+        llvm::FunctionType* userFnTy = llvm::FunctionType::get(voidTy, false);
+        for (auto* f : funcs) {
+            if (!module->getFunction(f->name)) {
+                llvm::Function::Create(userFnTy, llvm::Function::ExternalLinkage,
+                                       f->name, module.get());
+            }
+        }
+
         entryBB = llvm::BasicBlock::Create(context, "entry", mainFunc);
         builder->SetInsertPoint(entryBB);
 
@@ -44,11 +62,37 @@ public:
         declareScanf();
         declareStringFunctions();
 
-        for (auto& stmt : prog.statements) {
-            compileStmt(stmt.get());
-        }
-
+        for (auto* s : mainStmts) compileStmt(s);
         builder->CreateRet(llvm::ConstantInt::get(llvm::Type::getInt32Ty(context), 0));
+
+        for (auto* f : funcs) {
+            auto* fn = module->getFunction(f->name);
+            auto* bb = llvm::BasicBlock::Create(context, "entry", fn);
+
+            auto savedVarMap    = std::move(varMap);
+            auto savedConstMap  = std::move(constMap);
+            auto savedLoopStack = std::move(loopStack);
+            auto* savedMainFunc = mainFunc;
+            auto* savedEntryBB  = entryBB;
+
+            varMap.clear();
+            constMap.clear();
+            loopStack.clear();
+            mainFunc = fn;
+
+            builder->SetInsertPoint(bb);
+            auto* body = static_cast<Block*>(f->body.get());
+            if (body) {
+                for (auto& s : body->statements) compileStmt(s.get());
+            }
+            builder->CreateRetVoid();
+
+            varMap    = std::move(savedVarMap);
+            constMap  = std::move(savedConstMap);
+            loopStack = std::move(savedLoopStack);
+            mainFunc  = savedMainFunc;
+            entryBB   = savedEntryBB;
+        }
 
         if (llvm::verifyModule(*module, &llvm::errs())) {
             llvm::errs() << "Module verification failed\n";
@@ -398,8 +442,20 @@ private:
                     return compileInt(call);
                 } else if (call->name == "float") {
                     return compileFloat(call);
+                } else {
+                    auto* fn = module->getFunction(call->name);
+                    if (fn) {
+                        std::vector<llvm::Value*> args;
+                        for (auto& a : call->args) {
+                            auto v = compileExpr(a.get());
+                            if (!v) return nullptr;
+                            args.push_back(v);
+                        }
+                        return builder->CreateCall(fn, args, "");
+                    }
+                    llvm::errs() << "Error: unknown function '" << call->name << "'\n";
+                    return nullptr;
                 }
-                return nullptr;
             }
             default:
                 return nullptr;
@@ -455,6 +511,8 @@ private:
 
     void compileStmt(const ASTNode* stmt) {
         switch (stmt->type) {
+            case NodeType::FunctionDecl:
+                break;
             case NodeType::VarDecl: {
                 auto* vd = static_cast<const VarDecl*>(stmt);
                 llvm::Type* ty = nullptr;
@@ -648,6 +706,10 @@ private:
                 builder->CreateBr(condBB);
                 llvm::BasicBlock* dummyBB = llvm::BasicBlock::Create(context, "continue_dummy", mainFunc);
                 builder->SetInsertPoint(dummyBB);
+                break;
+            }
+            case NodeType::Call: {
+                compileExpr(stmt);
                 break;
             }
             default:
