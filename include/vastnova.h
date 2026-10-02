@@ -23,6 +23,23 @@ struct Token {
     Token(Type t, const std::string& v = "") : type(t), value(v) {}
 };
 
+static inline bool isExpressionStart(const Token& t) {
+    if (t.type == Token::Number || t.type == Token::String || t.type == Token::Ident)
+        return true;
+    if (t.type == Token::Keyword) {
+        if (t.value == "input" || t.value == "str" ||
+            t.value == "int"   || t.value == "float")
+            return true;
+    }
+    if (t.type == Token::Symbol && (t.value == "(" || t.value == "-"))
+        return true;
+    return false;
+}
+static inline bool isTypeKeyword(const std::string& s) {
+    return s == "i32" || s == "i64" || s == "f32" || s == "f64" ||
+           s == "str" || s == "void";
+}
+
 class Tokenizer {
     std::string src;
     size_t pos = 0;
@@ -73,9 +90,10 @@ public:
                 }
                 if (ident == "var" || ident == "let" || ident == "if" || ident == "else" ||
                     ident == "while" || ident == "break" || ident == "continue" ||
-                    ident == "import" || ident == "fn" ||
-                    ident == "print" || ident == "i32" || ident == "i64" ||
-                    ident == "f32" || ident == "f64" || ident == "str" ||
+                    ident == "import" || ident == "fn" || ident == "return" ||
+                    ident == "print" ||
+                    ident == "i32" || ident == "i64" || ident == "f32" || ident == "f64" ||
+                    ident == "str" || ident == "void" ||
                     ident == "input" || ident == "int" || ident == "float") {
                     tokens.emplace_back(Token::Keyword, ident);
                 } else {
@@ -109,6 +127,11 @@ public:
                 continue;
             }
 
+            if (c == '-' && i + 1 < src.size() && src[i+1] == '>') {
+                tokens.emplace_back(Token::Symbol, "->");
+                i += 2;
+                continue;
+            }
             if (c == '=' && i + 1 < src.size() && src[i+1] == '=') {
                 tokens.emplace_back(Token::Symbol, "==");
                 i += 2;
@@ -179,6 +202,7 @@ class Parser {
     }
 
     std::unique_ptr<ASTNode> parseExpression();
+    std::unique_ptr<ASTNode> parseUnary();
     std::unique_ptr<ASTNode> parsePrimary();
     std::unique_ptr<ASTNode> parseBinaryOp(int minPrec);
     std::unique_ptr<ASTNode> parseCondition();
@@ -283,8 +307,17 @@ std::unique_ptr<ASTNode> Parser::parsePrimary() {
     throw std::runtime_error("Unexpected token in expression: " + tok.value);
 }
 
+std::unique_ptr<ASTNode> Parser::parseUnary() {
+    if (current().type == Token::Symbol && current().value == "-") {
+        advance();
+        auto operand = parseUnary();
+        return std::make_unique<UnaryOp>("-", std::move(operand));
+    }
+    return parsePrimary();
+}
+
 std::unique_ptr<ASTNode> Parser::parseBinaryOp(int minPrec) {
-    auto left = parsePrimary();
+    auto left = parseUnary();
     while (true) {
         if (current().type != Token::Symbol) break;
         std::string op = current().value;
@@ -339,12 +372,47 @@ std::unique_ptr<ASTNode> Parser::parseStatement() {
         auto fn = std::make_unique<FunctionDecl>();
         fn->name = current().value;
         advance();
+
         if (!matchSymbol("("))
             throw std::runtime_error("Expected '(' after function name");
-        if (!matchSymbol(")"))
-            throw std::runtime_error("Parameters are not supported yet");
+        if (!matchSymbol(")")) {
+            while (true) {
+                if (current().type != Token::Ident)
+                    throw std::runtime_error("Expected parameter name");
+                Param p;
+                p.name = current().value;
+                advance();
+                if (!matchSymbol(":"))
+                    throw std::runtime_error("Expected ':' after parameter name");
+                if (current().type != Token::Keyword || !isTypeKeyword(current().value))
+                    throw std::runtime_error("Expected type after ':' in parameter");
+                p.type = current().value;
+                advance();
+                fn->params.push_back(p);
+                if (matchSymbol(",")) continue;
+                if (matchSymbol(")")) break;
+                throw std::runtime_error("Expected ',' or ')' in parameter list");
+            }
+        }
+
+        fn->returnType = "void";
+        if (matchSymbol("->")) {
+            if (current().type != Token::Keyword || !isTypeKeyword(current().value))
+                throw std::runtime_error("Expected type after '->'");
+            fn->returnType = current().value;
+            advance();
+        }
+
         fn->body = parseBlock();
         return fn;
+    }
+    if (tok.type == Token::Keyword && tok.value == "return") {
+        advance();
+        auto rs = std::make_unique<ReturnStmt>();
+        if (isExpressionStart(current())) {
+            rs->value = parseExpression();
+        }
+        return rs;
     }
     if (tok.type == Token::Keyword && tok.value == "var") {
         advance();
@@ -354,7 +422,8 @@ std::unique_ptr<ASTNode> Parser::parseStatement() {
         auto varDecl = std::make_unique<VarDecl>();
         varDecl->name = name;
         if (matchSymbol(":")) {
-            if (current().type != Token::Keyword) throw std::runtime_error("Expected type after ':'");
+            if (current().type != Token::Keyword || !isTypeKeyword(current().value))
+                throw std::runtime_error("Expected type after ':'");
             varDecl->type = current().value;
             advance();
         }
@@ -371,7 +440,8 @@ std::unique_ptr<ASTNode> Parser::parseStatement() {
         auto constDecl = std::make_unique<ConstDecl>();
         constDecl->name = name;
         if (matchSymbol(":")) {
-            if (current().type != Token::Keyword) throw std::runtime_error("Expected type after ':'");
+            if (current().type != Token::Keyword || !isTypeKeyword(current().value))
+                throw std::runtime_error("Expected type after ':'");
             constDecl->type = current().value;
             advance();
         }
@@ -429,11 +499,17 @@ std::unique_ptr<ASTNode> Parser::parseStatement() {
             return assign;
         } else if (matchSymbol("(")) {
             auto call = std::make_unique<Call>(name);
-            if (!matchSymbol(")"))
-                throw std::runtime_error("Parameters are not supported yet");
+            if (!matchSymbol(")")) {
+                while (true) {
+                    call->args.push_back(parseExpression());
+                    if (matchSymbol(",")) continue;
+                    if (matchSymbol(")")) break;
+                    throw std::runtime_error("Expected ',' or ')' in call arguments");
+                }
+            }
             return call;
         } else {
-            throw std::runtime_error("Unexpected identifier in statement, maybe missing '='?");
+            throw std::runtime_error("Unexpected identifier in statement, maybe missing '=' or '('?");
         }
     }
     throw std::runtime_error("Unexpected token in statement: " + tok.value);
@@ -455,7 +531,7 @@ inline std::string resolveImportPath(const std::string& importPath,
         fs::path p = fs::path(currentFile).parent_path() / importPath;
         if (fs::exists(p)) return fs::absolute(p).string();
     }
-    
+
     if (fs::exists(importPath)) return fs::absolute(importPath).string();
 
     throw std::runtime_error("Cannot find import file: " + importPath);
@@ -525,8 +601,23 @@ void printAST(const ASTNode* node, int indent = 0) {
         }
         case NodeType::FunctionDecl: {
             auto f = static_cast<const FunctionDecl*>(node);
-            std::cout << prefix << "Function: " << f->name << "()\n";
+            std::cout << prefix << "Function: " << f->name << "(";
+            for (size_t i = 0; i < f->params.size(); ++i) {
+                if (i > 0) std::cout << ", ";
+                std::cout << f->params[i].name << " : " << f->params[i].type;
+            }
+            std::cout << ") -> " << f->returnType << "\n";
             printAST(f->body.get(), indent + 1);
+            break;
+        }
+        case NodeType::ReturnStmt: {
+            auto r = static_cast<const ReturnStmt*>(node);
+            std::cout << prefix << "Return";
+            if (r->value) {
+                std::cout << ": ";
+                printAST(r->value.get(), 0);
+            }
+            std::cout << "\n";
             break;
         }
         case NodeType::ImportStmt: {
@@ -612,6 +703,12 @@ void printAST(const ASTNode* node, int indent = 0) {
         case NodeType::Variable: {
             auto v = static_cast<const Variable*>(node);
             std::cout << prefix << "Variable: " << v->name;
+            break;
+        }
+        case NodeType::UnaryOp: {
+            auto u = static_cast<const UnaryOp*>(node);
+            std::cout << prefix << "UnaryOp(" << u->op << "):\n";
+            printAST(u->operand.get(), indent + 1);
             break;
         }
         case NodeType::BinaryOp: {

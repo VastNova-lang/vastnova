@@ -27,16 +27,13 @@ class LLVMCodeGen {
     std::map<std::string, llvm::AllocaInst*> varMap;
     std::map<std::string, llvm::Constant*> constMap;
     std::vector<std::pair<llvm::BasicBlock*, llvm::BasicBlock*>> loopStack;
+    std::string currentReturnType;
 
 public:
     LLVMCodeGen() : module(std::make_unique<llvm::Module>("vastnova", context)),
                     builder(std::make_unique<llvm::IRBuilder<>>(context)) {}
 
     std::string generate(const Program& prog) {
-        llvm::FunctionType* mainType = llvm::FunctionType::get(
-            llvm::Type::getInt32Ty(context), false);
-        mainFunc = llvm::Function::Create(mainType, llvm::Function::ExternalLinkage,
-                                          "main", module.get());
         std::vector<const FunctionDecl*> funcs;
         std::vector<const ASTNode*> mainStmts;
         for (auto& s : prog.statements) {
@@ -46,11 +43,18 @@ public:
                 mainStmts.push_back(s.get());
         }
 
-        llvm::Type* voidTy = llvm::Type::getVoidTy(context);
-        llvm::FunctionType* userFnTy = llvm::FunctionType::get(voidTy, false);
+        llvm::FunctionType* mainType = llvm::FunctionType::get(
+            llvm::Type::getInt32Ty(context), false);
+        mainFunc = llvm::Function::Create(mainType, llvm::Function::ExternalLinkage,
+                                          "main", module.get());
+
         for (auto* f : funcs) {
+            std::vector<llvm::Type*> paramTys;
+            for (auto& p : f->params) paramTys.push_back(mapType(p.type));
+            llvm::Type* retTy = mapType(f->returnType);
+            auto* fnTy = llvm::FunctionType::get(retTy, paramTys, false);
             if (!module->getFunction(f->name)) {
-                llvm::Function::Create(userFnTy, llvm::Function::ExternalLinkage,
+                llvm::Function::Create(fnTy, llvm::Function::ExternalLinkage,
                                        f->name, module.get());
             }
         }
@@ -62,6 +66,7 @@ public:
         declareScanf();
         declareStringFunctions();
 
+        currentReturnType = "void";
         for (auto* s : mainStmts) compileStmt(s);
         builder->CreateRet(llvm::ConstantInt::get(llvm::Type::getInt32Ty(context), 0));
 
@@ -73,25 +78,39 @@ public:
             auto savedConstMap  = std::move(constMap);
             auto savedLoopStack = std::move(loopStack);
             auto* savedMainFunc = mainFunc;
-            auto* savedEntryBB  = entryBB;
+            auto  savedRetType  = currentReturnType;
 
             varMap.clear();
             constMap.clear();
             loopStack.clear();
             mainFunc = fn;
+            currentReturnType = f->returnType;
 
             builder->SetInsertPoint(bb);
+
+            auto argIt = fn->arg_begin();
+            for (auto& p : f->params) {
+                llvm::Type* pty = mapType(p.type);
+                auto* alloca = builder->CreateAlloca(pty, nullptr, p.name);
+                builder->CreateStore(&*argIt, alloca);
+                varMap[p.name] = alloca;
+                ++argIt;
+            }
+
             auto* body = static_cast<Block*>(f->body.get());
             if (body) {
                 for (auto& s : body->statements) compileStmt(s.get());
             }
-            builder->CreateRetVoid();
+
+            if (!builder->GetInsertBlock()->getTerminator()) {
+                addDefaultReturn(f->returnType);
+            }
 
             varMap    = std::move(savedVarMap);
             constMap  = std::move(savedConstMap);
             loopStack = std::move(savedLoopStack);
             mainFunc  = savedMainFunc;
-            entryBB   = savedEntryBB;
+            currentReturnType = savedRetType;
         }
 
         if (llvm::verifyModule(*module, &llvm::errs())) {
@@ -107,6 +126,32 @@ public:
 private:
     llvm::PointerType* getInt8PtrTy() {
         return llvm::PointerType::get(context, 0);
+    }
+
+    llvm::Type* mapType(const std::string& t) {
+        if (t == "i32")  return llvm::Type::getInt32Ty(context);
+        if (t == "i64")  return llvm::Type::getInt64Ty(context);
+        if (t == "f32")  return llvm::Type::getFloatTy(context);
+        if (t == "f64")  return llvm::Type::getDoubleTy(context);
+        if (t == "str")  return getInt8PtrTy();
+        if (t == "void" || t.empty()) return llvm::Type::getVoidTy(context);
+        return llvm::Type::getInt32Ty(context);
+    }
+
+    void addDefaultReturn(const std::string& retType) {
+        llvm::Type* ty = mapType(retType);
+        if (ty->isVoidTy()) {
+            builder->CreateRetVoid();
+        } else if (ty->isIntegerTy()) {
+            builder->CreateRet(llvm::ConstantInt::get(ty, 0));
+        } else if (ty->isFloatingPointTy()) {
+            builder->CreateRet(llvm::ConstantFP::get(ty, 0.0));
+        } else if (ty->isPointerTy()) {
+            builder->CreateRet(llvm::ConstantPointerNull::get(
+                llvm::cast<llvm::PointerType>(ty)));
+        } else {
+            builder->CreateRetVoid();
+        }
     }
 
     void declarePrintf() {
@@ -144,7 +189,9 @@ private:
             llvm::Type::getInt64Ty(context), strlenArgs, false);
         module->getOrInsertFunction("strlen", strlenType);
 
-        std::vector<llvm::Type*> snprintfArgs = {getInt8PtrTy(), llvm::Type::getInt64Ty(context), getInt8PtrTy()};
+        std::vector<llvm::Type*> snprintfArgs = {
+            getInt8PtrTy(), llvm::Type::getInt64Ty(context), getInt8PtrTy()
+        };
         llvm::FunctionType* snprintfType = llvm::FunctionType::get(
             llvm::Type::getInt32Ty(context), snprintfArgs, true);
         module->getOrInsertFunction("snprintf", snprintfType);
@@ -158,60 +205,6 @@ private:
         llvm::FunctionType* atofType = llvm::FunctionType::get(
             llvm::Type::getDoubleTy(context), atofArgs, false);
         module->getOrInsertFunction("atof", atofType);
-    }
-
-    llvm::Type* inferType(const ASTNode* node) {
-        switch (node->type) {
-            case NodeType::Number: {
-                auto* num = static_cast<const Number*>(node);
-                if (num->value.find('.') != std::string::npos) {
-                    return llvm::Type::getDoubleTy(context);
-                } else {
-                    return llvm::Type::getInt32Ty(context);
-                }
-            }
-            case NodeType::StringLit:
-                return getInt8PtrTy();
-            case NodeType::Call: {
-                auto* call = static_cast<const Call*>(node);
-                if (call->name == "input") return getInt8PtrTy();
-                if (call->name == "str") return getInt8PtrTy();
-                if (call->name == "int") return llvm::Type::getInt32Ty(context);
-                if (call->name == "float") return llvm::Type::getDoubleTy(context);
-                return llvm::Type::getInt32Ty(context);
-            }
-            case NodeType::BinaryOp: {
-                auto* bin = static_cast<const BinaryOp*>(node);
-                auto leftTy = inferType(bin->left.get());
-                auto rightTy = inferType(bin->right.get());
-                if (bin->op == "+") {
-                    if (leftTy == getInt8PtrTy() || rightTy == getInt8PtrTy())
-                        return getInt8PtrTy();
-                    if (leftTy->isFloatingPointTy() || rightTy->isFloatingPointTy())
-                        return llvm::Type::getDoubleTy(context);
-                    return llvm::Type::getInt32Ty(context);
-                }
-                if (bin->op == ">" || bin->op == "<" || bin->op == "==" || bin->op == "!=" ||
-                    bin->op == ">=" || bin->op == "<=" || bin->op == "&&" || bin->op == "||") {
-                    return llvm::Type::getInt32Ty(context);
-                }
-                if (leftTy->isFloatingPointTy() || rightTy->isFloatingPointTy())
-                    return llvm::Type::getDoubleTy(context);
-                return llvm::Type::getInt32Ty(context);
-            }
-            case NodeType::Variable: {
-                auto* var = static_cast<const Variable*>(node);
-                auto it = varMap.find(var->name);
-                if (it != varMap.end())
-                    return it->second->getAllocatedType();
-                auto cit = constMap.find(var->name);
-                if (cit != constMap.end())
-                    return cit->second->getType();
-                return llvm::Type::getInt32Ty(context);
-            }
-            default:
-                return llvm::Type::getInt32Ty(context);
-        }
     }
 
     llvm::Value* convertValue(llvm::Value* val, llvm::Type* targetTy) {
@@ -270,7 +263,8 @@ private:
 
         auto strlenFn = module->getFunction("strlen");
         auto actualLen = builder->CreateCall(strlenFn, {bufPtr});
-        auto plusOne = builder->CreateAdd(actualLen, llvm::ConstantInt::get(llvm::Type::getInt64Ty(context), 1));
+        auto plusOne = builder->CreateAdd(actualLen,
+            llvm::ConstantInt::get(llvm::Type::getInt64Ty(context), 1));
 
         auto mallocFn = module->getFunction("malloc");
         auto result = builder->CreateCall(mallocFn, {plusOne}, "str_result");
@@ -305,163 +299,6 @@ private:
         return nullptr;
     }
 
-    llvm::Value* compileExpr(const ASTNode* node) {
-        switch (node->type) {
-            case NodeType::Number: {
-                auto* num = static_cast<const Number*>(node);
-                if (num->value.find('.') != std::string::npos) {
-                    return llvm::ConstantFP::get(llvm::Type::getDoubleTy(context),
-                                                 std::stod(num->value));
-                } else {
-                    int64_t val = std::stoll(num->value);
-                    return llvm::ConstantInt::get(llvm::Type::getInt32Ty(context), val, true);
-                }
-            }
-            case NodeType::StringLit: {
-                auto* str = static_cast<const StringLiteral*>(node);
-                return builder->CreateGlobalString(str->value, "str_lit");
-            }
-            case NodeType::Variable: {
-                auto* var = static_cast<const Variable*>(node);
-                if (constMap.count(var->name)) {
-                    return constMap[var->name];
-                } else {
-                    auto it = varMap.find(var->name);
-                    if (it != varMap.end()) {
-                        auto* alloca = it->second;
-                        auto* ty = alloca->getAllocatedType();
-                        return builder->CreateLoad(ty, alloca, var->name);
-                    } else {
-                        return nullptr;
-                    }
-                }
-            }
-            case NodeType::BinaryOp: {
-                auto* bin = static_cast<const BinaryOp*>(node);
-                auto left = compileExpr(bin->left.get());
-                auto right = compileExpr(bin->right.get());
-                if (!left || !right) return nullptr;
-                std::string op = bin->op;
-                llvm::Type* resultTy = inferType(node);
-                if (!resultTy) resultTy = llvm::Type::getInt32Ty(context);
-
-                if (op == ">" || op == "<" || op == "==" || op == "!=" ||
-                    op == ">=" || op == "<=") {
-                    bool leftIsPtr = left->getType()->isPointerTy();
-                    bool rightIsPtr = right->getType()->isPointerTy();
-
-                    if (leftIsPtr && rightIsPtr) {
-                        if (op == "==" || op == "!=") {
-                            return callStrcmp(left, right);
-                        } else {
-                            llvm::errs() << "Error: string comparison with '" << op
-                                         << "' is not allowed. Use only == or != for strings.\n";
-                            return nullptr;
-                        }
-                    }
-
-                    left = convertValue(left, resultTy);
-                    right = convertValue(right, resultTy);
-
-                    llvm::Value* cmp;
-                    if (resultTy->isIntegerTy()) {
-                        if (op == ">") cmp = builder->CreateICmpSGT(left, right, "cmpgt");
-                        else if (op == "<") cmp = builder->CreateICmpSLT(left, right, "cmplt");
-                        else if (op == "==") cmp = builder->CreateICmpEQ(left, right, "cmpeq");
-                        else if (op == "!=") cmp = builder->CreateICmpNE(left, right, "cmpne");
-                        else if (op == ">=") cmp = builder->CreateICmpSGE(left, right, "cmpge");
-                        else if (op == "<=") cmp = builder->CreateICmpSLE(left, right, "cmple");
-                    } else if (resultTy->isFloatingPointTy()) {
-                        if (op == ">") cmp = builder->CreateFCmpOGT(left, right, "fcmpgt");
-                        else if (op == "<") cmp = builder->CreateFCmpOLT(left, right, "fcmplt");
-                        else if (op == "==") cmp = builder->CreateFCmpOEQ(left, right, "fcmpeq");
-                        else if (op == "!=") cmp = builder->CreateFCmpONE(left, right, "fcmpne");
-                        else if (op == ">=") cmp = builder->CreateFCmpOGE(left, right, "fcmpge");
-                        else if (op == "<=") cmp = builder->CreateFCmpOLE(left, right, "fcmple");
-                    } else {
-                        return nullptr;
-                    }
-                    return builder->CreateZExt(cmp, llvm::Type::getInt32Ty(context), "cmp_zext");
-                }
-
-                if (op == "&&") {
-                    auto leftBool = builder->CreateICmpNE(left, llvm::ConstantInt::get(left->getType(), 0));
-                    auto rightBool = builder->CreateICmpNE(right, llvm::ConstantInt::get(right->getType(), 0));
-                    auto andVal = builder->CreateAnd(leftBool, rightBool, "andtmp");
-                    return builder->CreateZExt(andVal, llvm::Type::getInt32Ty(context), "and_zext");
-                }
-                if (op == "||") {
-                    auto leftBool = builder->CreateICmpNE(left, llvm::ConstantInt::get(left->getType(), 0));
-                    auto rightBool = builder->CreateICmpNE(right, llvm::ConstantInt::get(right->getType(), 0));
-                    auto orVal = builder->CreateOr(leftBool, rightBool, "ortmp");
-                    return builder->CreateZExt(orVal, llvm::Type::getInt32Ty(context), "or_zext");
-                }
-
-                left = convertValue(left, resultTy);
-                right = convertValue(right, resultTy);
-
-                if (op == "+") {
-                    if (resultTy->isIntegerTy()) {
-                        return builder->CreateAdd(left, right, "addtmp");
-                    } else if (resultTy->isFloatingPointTy()) {
-                        return builder->CreateFAdd(left, right, "faddtmp");
-                    } else if (resultTy->isPointerTy()) {
-                        return concatStrings(left, right);
-                    }
-                } else if (op == "-") {
-                    if (resultTy->isIntegerTy()) {
-                        return builder->CreateSub(left, right, "subtmp");
-                    } else if (resultTy->isFloatingPointTy()) {
-                        return builder->CreateFSub(left, right, "fsubtmp");
-                    }
-                } else if (op == "*") {
-                    if (resultTy->isIntegerTy()) {
-                        return builder->CreateMul(left, right, "multmp");
-                    } else if (resultTy->isFloatingPointTy()) {
-                        return builder->CreateFMul(left, right, "fmultmp");
-                    }
-                } else if (op == "/") {
-                    if (resultTy->isIntegerTy()) {
-                        return builder->CreateSDiv(left, right, "divtmp");
-                    } else if (resultTy->isFloatingPointTy()) {
-                        return builder->CreateFDiv(left, right, "fdivtmp");
-                    }
-                }
-                return nullptr;
-            }
-            case NodeType::Call: {
-                auto* call = static_cast<const Call*>(node);
-                if (call->name == "input") {
-                    return compileInput(call);
-                } else if (call->name == "str") {
-                    if (call->args.size() != 1) return nullptr;
-                    auto arg = compileExpr(call->args[0].get());
-                    if (!arg) return nullptr;
-                    return compileStr(arg);
-                } else if (call->name == "int") {
-                    return compileInt(call);
-                } else if (call->name == "float") {
-                    return compileFloat(call);
-                } else {
-                    auto* fn = module->getFunction(call->name);
-                    if (fn) {
-                        std::vector<llvm::Value*> args;
-                        for (auto& a : call->args) {
-                            auto v = compileExpr(a.get());
-                            if (!v) return nullptr;
-                            args.push_back(v);
-                        }
-                        return builder->CreateCall(fn, args, "");
-                    }
-                    llvm::errs() << "Error: unknown function '" << call->name << "'\n";
-                    return nullptr;
-                }
-            }
-            default:
-                return nullptr;
-        }
-    }
-
     llvm::Value* compileInput(const Call* call) {
         if (!call->args.empty()) {
             auto prompt = compileExpr(call->args[0].get());
@@ -477,7 +314,8 @@ private:
 
         auto strlenFn = module->getFunction("strlen");
         auto len = builder->CreateCall(strlenFn, {bufferPtr}, "strlen");
-        auto plusOne = builder->CreateAdd(len, llvm::ConstantInt::get(llvm::Type::getInt64Ty(context), 1));
+        auto plusOne = builder->CreateAdd(len,
+            llvm::ConstantInt::get(llvm::Type::getInt64Ty(context), 1));
         auto mallocFn = module->getFunction("malloc");
         auto result = builder->CreateCall(mallocFn, {plusOne}, "strdup_result");
         auto strcpyFn = module->getFunction("strcpy");
@@ -490,7 +328,7 @@ private:
         auto lenL = builder->CreateCall(strlenFn, {left});
         auto lenR = builder->CreateCall(strlenFn, {right});
         auto total = builder->CreateAdd(builder->CreateAdd(lenL, lenR),
-                                        llvm::ConstantInt::get(llvm::Type::getInt64Ty(context), 1));
+            llvm::ConstantInt::get(llvm::Type::getInt64Ty(context), 1));
         auto mallocFn = module->getFunction("malloc");
         auto result = builder->CreateCall(mallocFn, {total});
         auto strcpyFn = module->getFunction("strcpy");
@@ -505,43 +343,273 @@ private:
             llvm::FunctionType::get(llvm::Type::getInt32Ty(context),
                                     {getInt8PtrTy(), getInt8PtrTy()}, false));
         auto cmp = builder->CreateCall(strcmpFn, {left, right});
-        auto cmpZero = builder->CreateICmpEQ(cmp, llvm::ConstantInt::get(llvm::Type::getInt32Ty(context), 0));
+        auto cmpZero = builder->CreateICmpEQ(cmp,
+            llvm::ConstantInt::get(llvm::Type::getInt32Ty(context), 0));
         return builder->CreateZExt(cmpZero, llvm::Type::getInt32Ty(context));
+    }
+
+    llvm::Value* compileExpr(const ASTNode* node) {
+        switch (node->type) {
+            case NodeType::Number: {
+                auto* num = static_cast<const Number*>(node);
+                if (num->value.find('.') != std::string::npos) {
+                    return llvm::ConstantFP::get(llvm::Type::getDoubleTy(context),
+                                                 std::stod(num->value));
+                } else {
+                    int64_t val = std::stoll(num->value);
+                    return llvm::ConstantInt::get(
+                        llvm::Type::getInt32Ty(context), val, true);
+                }
+            }
+            case NodeType::StringLit: {
+                auto* str = static_cast<const StringLiteral*>(node);
+                return builder->CreateGlobalString(str->value, "str_lit");
+            }
+            case NodeType::Variable: {
+                auto* var = static_cast<const Variable*>(node);
+                if (constMap.count(var->name)) {
+                    return constMap[var->name];
+                }
+                auto it = varMap.find(var->name);
+                if (it != varMap.end()) {
+                    auto* alloca = it->second;
+                    auto* ty = alloca->getAllocatedType();
+                    return builder->CreateLoad(ty, alloca, var->name);
+                }
+                llvm::errs() << "Error: unknown variable '" << var->name << "'\n";
+                return nullptr;
+            }
+            case NodeType::UnaryOp: {
+                auto* u = static_cast<const UnaryOp*>(node);
+                auto v = compileExpr(u->operand.get());
+                if (!v) return nullptr;
+                if (u->op == "-") {
+                    if (v->getType()->isIntegerTy()) {
+                        return builder->CreateNeg(v, "negtmp");
+                    } else if (v->getType()->isFloatingPointTy()) {
+                        return builder->CreateFNeg(v, "fnegtmp");
+                    } else {
+                        llvm::errs() << "Error: unary '-' cannot be applied to this type\n";
+                        return nullptr;
+                    }
+                }
+                llvm::errs() << "Error: unknown unary operator '" << u->op << "'\n";
+                return nullptr;
+            }
+            case NodeType::BinaryOp: {
+                auto* bin = static_cast<const BinaryOp*>(node);
+                auto left = compileExpr(bin->left.get());
+                auto right = compileExpr(bin->right.get());
+                if (!left || !right) return nullptr;
+                std::string op = bin->op;
+
+                if (op == ">" || op == "<" || op == "==" || op == "!=" ||
+                    op == ">=" || op == "<=") {
+                    bool leftIsPtr  = left->getType()->isPointerTy();
+                    bool rightIsPtr = right->getType()->isPointerTy();
+
+                    if (leftIsPtr && rightIsPtr) {
+                        if (op == "==" || op == "!=") {
+                            return callStrcmp(left, right);
+                        }
+                        llvm::errs() << "Error: string comparison with '" << op
+                                     << "' is not allowed. Use only == or != for strings.\n";
+                        return nullptr;
+                    }
+
+                    llvm::Type* commonTy;
+                    if (left->getType()->isFloatingPointTy() || right->getType()->isFloatingPointTy())
+                        commonTy = llvm::Type::getDoubleTy(context);
+                    else
+                        commonTy = llvm::Type::getInt32Ty(context);
+
+                    left  = convertValue(left, commonTy);
+                    right = convertValue(right, commonTy);
+
+                    llvm::Value* cmp = nullptr;
+                    if (commonTy->isIntegerTy()) {
+                        if (op == ">")  cmp = builder->CreateICmpSGT(left, right, "cmpgt");
+                        else if (op == "<")  cmp = builder->CreateICmpSLT(left, right, "cmplt");
+                        else if (op == "==") cmp = builder->CreateICmpEQ(left, right, "cmpeq");
+                        else if (op == "!=") cmp = builder->CreateICmpNE(left, right, "cmpne");
+                        else if (op == ">=") cmp = builder->CreateICmpSGE(left, right, "cmpge");
+                        else if (op == "<=") cmp = builder->CreateICmpSLE(left, right, "cmple");
+                    } else {
+                        if (op == ">")  cmp = builder->CreateFCmpOGT(left, right, "fcmpgt");
+                        else if (op == "<")  cmp = builder->CreateFCmpOLT(left, right, "fcmplt");
+                        else if (op == "==") cmp = builder->CreateFCmpOEQ(left, right, "fcmpeq");
+                        else if (op == "!=") cmp = builder->CreateFCmpONE(left, right, "fcmpne");
+                        else if (op == ">=") cmp = builder->CreateFCmpOGE(left, right, "fcmpge");
+                        else if (op == "<=") cmp = builder->CreateFCmpOLE(left, right, "fcmple");
+                    }
+                    return builder->CreateZExt(cmp,
+                        llvm::Type::getInt32Ty(context), "cmp_zext");
+                }
+
+                if (op == "&&") {
+                    auto lb = builder->CreateICmpNE(left,
+                        llvm::ConstantInt::get(left->getType(), 0));
+                    auto rb = builder->CreateICmpNE(right,
+                        llvm::ConstantInt::get(right->getType(), 0));
+                    auto andVal = builder->CreateAnd(lb, rb, "andtmp");
+                    return builder->CreateZExt(andVal,
+                        llvm::Type::getInt32Ty(context), "and_zext");
+                }
+                if (op == "||") {
+                    auto lb = builder->CreateICmpNE(left,
+                        llvm::ConstantInt::get(left->getType(), 0));
+                    auto rb = builder->CreateICmpNE(right,
+                        llvm::ConstantInt::get(right->getType(), 0));
+                    auto orVal = builder->CreateOr(lb, rb, "ortmp");
+                    return builder->CreateZExt(orVal,
+                        llvm::Type::getInt32Ty(context), "or_zext");
+                }
+
+                bool stringConcat =
+                    (op == "+" &&
+                     left->getType()->isPointerTy() &&
+                     right->getType()->isPointerTy());
+                if (stringConcat) return concatStrings(left, right);
+
+                llvm::Type* commonTy;
+                if (left->getType()->isFloatingPointTy() ||
+                    right->getType()->isFloatingPointTy())
+                    commonTy = llvm::Type::getDoubleTy(context);
+                else
+                    commonTy = llvm::Type::getInt32Ty(context);
+
+                left  = convertValue(left, commonTy);
+                right = convertValue(right, commonTy);
+
+                if (op == "+") {
+                    return commonTy->isIntegerTy()
+                        ? builder->CreateAdd(left, right, "addtmp")
+                        : builder->CreateFAdd(left, right, "faddtmp");
+                } else if (op == "-") {
+                    return commonTy->isIntegerTy()
+                        ? builder->CreateSub(left, right, "subtmp")
+                        : builder->CreateFSub(left, right, "fsubtmp");
+                } else if (op == "*") {
+                    return commonTy->isIntegerTy()
+                        ? builder->CreateMul(left, right, "multmp")
+                        : builder->CreateFMul(left, right, "fmultmp");
+                } else if (op == "/") {
+                    return commonTy->isIntegerTy()
+                        ? builder->CreateSDiv(left, right, "divtmp")
+                        : builder->CreateFDiv(left, right, "fdivtmp");
+                }
+                return nullptr;
+            }
+            case NodeType::Call: {
+                auto* call = static_cast<const Call*>(node);
+                if (call->name == "input") return compileInput(call);
+                if (call->name == "str") {
+                    if (call->args.size() != 1) return nullptr;
+                    auto arg = compileExpr(call->args[0].get());
+                    if (!arg) return nullptr;
+                    return compileStr(arg);
+                }
+                if (call->name == "int")   return compileInt(call);
+                if (call->name == "float") return compileFloat(call);
+
+                auto* fn = module->getFunction(call->name);
+                if (!fn) {
+                    llvm::errs() << "Error: unknown function '" << call->name << "'\n";
+                    return nullptr;
+                }
+                if (call->args.size() != fn->arg_size()) {
+                    llvm::errs() << "Error: function '" << call->name << "' expects "
+                                 << fn->arg_size() << " argument(s), got "
+                                 << call->args.size() << "\n";
+                    return nullptr;
+                }
+                std::vector<llvm::Value*> args;
+                for (size_t i = 0; i < call->args.size(); ++i) {
+                    auto v = compileExpr(call->args[i].get());
+                    if (!v) return nullptr;
+                    auto* pty = fn->getFunctionType()->getParamType(i);
+                    if (v->getType() != pty) v = convertValue(v, pty);
+                    args.push_back(v);
+                }
+                if (fn->getReturnType()->isVoidTy()) {
+                    return builder->CreateCall(fn, args);
+                }
+                return builder->CreateCall(fn, args, "calltmp");
+            }
+            default:
+                return nullptr;
+        }
     }
 
     void compileStmt(const ASTNode* stmt) {
         switch (stmt->type) {
             case NodeType::FunctionDecl:
                 break;
+
+            case NodeType::ReturnStmt: {
+                auto* rs = static_cast<const ReturnStmt*>(stmt);
+
+                if (currentReturnType == "void") {
+                    if (rs->value) {
+                        llvm::errs() << "Error: 'return' with a value inside a void function\n";
+                    }
+                    builder->CreateRetVoid();
+                } else {
+                    llvm::Type* retTy = mapType(currentReturnType);
+                    if (!rs->value) {
+                        llvm::errs() << "Error: 'return' without a value inside a non-void function\n";
+                        addDefaultReturn(currentReturnType);
+                    } else {
+                        auto v = compileExpr(rs->value.get());
+                        if (!v) {
+                            addDefaultReturn(currentReturnType);
+                        } else {
+                            v = convertValue(v, retTy);
+                            builder->CreateRet(v);
+                        }
+                    }
+                }
+                {
+                    llvm::BasicBlock* dummy = llvm::BasicBlock::Create(
+                        context, "after_ret", mainFunc);
+                    builder->SetInsertPoint(dummy);
+                }
+                break;
+            }
+
             case NodeType::VarDecl: {
                 auto* vd = static_cast<const VarDecl*>(stmt);
                 llvm::Type* ty = nullptr;
+
                 if (!vd->type.empty()) {
-                    if (vd->type == "i32") ty = llvm::Type::getInt32Ty(context);
-                    else if (vd->type == "i64") ty = llvm::Type::getInt64Ty(context);
-                    else if (vd->type == "f64") ty = llvm::Type::getDoubleTy(context);
-                    else if (vd->type == "str") ty = getInt8PtrTy();
-                    else ty = llvm::Type::getInt32Ty(context);
-                } else {
-                    if (vd->init) {
-                        ty = inferType(vd->init.get());
-                    } else {
+                    ty = mapType(vd->type);
+                } else if (vd->init) {
+                    auto v = compileExpr(vd->init.get());
+                    if (!v) {
                         ty = llvm::Type::getInt32Ty(context);
+                    } else {
+                        ty = v->getType();
+                        auto* alloca = builder->CreateAlloca(ty, nullptr, vd->name);
+                        varMap[vd->name] = alloca;
+                        builder->CreateStore(v, alloca);
+                        break;
                     }
+                } else {
+                    ty = llvm::Type::getInt32Ty(context);
                 }
-                auto alloca = builder->CreateAlloca(ty, nullptr, vd->name);
+
+                auto* alloca = builder->CreateAlloca(ty, nullptr, vd->name);
                 varMap[vd->name] = alloca;
                 if (vd->init) {
                     auto val = compileExpr(vd->init.get());
                     if (val) {
-                        if (val->getType() != ty) {
-                            val = convertValue(val, ty);
-                        }
+                        if (val->getType() != ty) val = convertValue(val, ty);
                         builder->CreateStore(val, alloca);
                     }
                 }
                 break;
             }
+
             case NodeType::ConstDecl: {
                 auto* cd = static_cast<const ConstDecl*>(stmt);
                 auto val = compileExpr(cd->init.get());
@@ -550,109 +618,111 @@ private:
                 }
                 break;
             }
+
             case NodeType::Assign: {
                 auto* as = static_cast<const Assign*>(stmt);
                 auto it = varMap.find(as->name);
-                if (it != varMap.end()) {
-                    auto val = compileExpr(as->value.get());
-                    if (val) {
-                        auto varTy = it->second->getAllocatedType();
-                        if (val->getType() != varTy) {
-                            val = convertValue(val, varTy);
-                        }
-                        builder->CreateStore(val, it->second);
-                    }
+                if (it == varMap.end()) {
+                    llvm::errs() << "Error: unknown variable '" << as->name << "'\n";
+                    break;
+                }
+                auto val = compileExpr(as->value.get());
+                if (val) {
+                    auto* varTy = it->second->getAllocatedType();
+                    if (val->getType() != varTy) val = convertValue(val, varTy);
+                    builder->CreateStore(val, it->second);
                 }
                 break;
             }
+
             case NodeType::PrintStmt: {
                 auto* ps = static_cast<const PrintStmt*>(stmt);
-                size_t numArgs = ps->args.size();
-                for (size_t i = 0; i < numArgs; ++i) {
+                size_t n = ps->args.size();
+                for (size_t i = 0; i < n; ++i) {
                     auto val = compileExpr(ps->args[i].get());
-                    if (val) {
-                        std::string format;
-                        if (val->getType()->isIntegerTy()) {
-                            format = "%d";
-                        } else if (val->getType()->isFloatingPointTy()) {
-                            format = "%f";
-                        } else if (val->getType()->isPointerTy()) {
-                            format = "%s";
-                        } else {
-                            format = "%p";
-                        }
-                        auto formatStr = builder->CreateGlobalString(format, "printf_fmt");
-                        builder->CreateCall(module->getFunction("printf"), {formatStr, val});
-                        if (i != numArgs - 1) {
-                            auto space = builder->CreateGlobalString(" ", "space");
-                            builder->CreateCall(module->getFunction("printf"), {space});
-                        }
+                    if (!val) continue;
+                    std::string format;
+                    if (val->getType()->isIntegerTy())
+                        format = "%d";
+                    else if (val->getType()->isFloatingPointTy())
+                        format = "%f";
+                    else if (val->getType()->isPointerTy())
+                        format = "%s";
+                    else
+                        format = "%p";
+
+                    auto formatStr = builder->CreateGlobalString(format, "printf_fmt");
+                    builder->CreateCall(module->getFunction("printf"), {formatStr, val});
+
+                    if (i != n - 1) {
+                        auto space = builder->CreateGlobalString(" ", "space");
+                        builder->CreateCall(module->getFunction("printf"), {space});
                     }
                 }
                 auto newline = builder->CreateGlobalString("\n", "newline");
                 builder->CreateCall(module->getFunction("printf"), {newline});
                 break;
             }
+
             case NodeType::IfStmt: {
                 auto* ifs = static_cast<const IfStmt*>(stmt);
                 auto condVal = compileExpr(ifs->condition.get());
                 if (!condVal) break;
 
                 llvm::Value* condBool;
-                if (condVal->getType()->isIntegerTy()) {
-                    condBool = builder->CreateICmpNE(condVal, llvm::ConstantInt::get(condVal->getType(), 0));
-                } else if (condVal->getType()->isFloatingPointTy()) {
-                    condBool = builder->CreateFCmpONE(condVal, llvm::ConstantFP::get(condVal->getType(), 0.0));
-                } else if (condVal->getType()->isPointerTy()) {
-                    condBool = builder->CreateICmpNE(condVal, llvm::ConstantPointerNull::get(llvm::cast<llvm::PointerType>(condVal->getType())));
-                } else {
-                    condBool = builder->CreateICmpNE(condVal, llvm::ConstantInt::get(condVal->getType(), 0));
-                }
+                if (condVal->getType()->isIntegerTy())
+                    condBool = builder->CreateICmpNE(condVal,
+                        llvm::ConstantInt::get(condVal->getType(), 0));
+                else if (condVal->getType()->isFloatingPointTy())
+                    condBool = builder->CreateFCmpONE(condVal,
+                        llvm::ConstantFP::get(condVal->getType(), 0.0));
+                else if (condVal->getType()->isPointerTy())
+                    condBool = builder->CreateICmpNE(condVal,
+                        llvm::ConstantPointerNull::get(
+                            llvm::cast<llvm::PointerType>(condVal->getType())));
+                else
+                    condBool = builder->CreateICmpNE(condVal,
+                        llvm::ConstantInt::get(condVal->getType(), 0));
 
-                llvm::Function* func = mainFunc;
-                llvm::BasicBlock* thenBB = llvm::BasicBlock::Create(context, "if_then", func);
-                llvm::BasicBlock* endBB = llvm::BasicBlock::Create(context, "if_end", func);
+                llvm::BasicBlock* thenBB = llvm::BasicBlock::Create(
+                    context, "if_then", mainFunc);
+                llvm::BasicBlock* endBB = llvm::BasicBlock::Create(
+                    context, "if_end", mainFunc);
                 llvm::BasicBlock* elseBB = nullptr;
 
                 if (ifs->elseBlock) {
-                    elseBB = llvm::BasicBlock::Create(context, "if_else", func);
+                    elseBB = llvm::BasicBlock::Create(context, "if_else", mainFunc);
                     builder->CreateCondBr(condBool, thenBB, elseBB);
                 } else {
                     builder->CreateCondBr(condBool, thenBB, endBB);
                 }
 
                 builder->SetInsertPoint(thenBB);
-                auto* thenNode = static_cast<Block*>(ifs->thenBlock.get());
-                if (thenNode) {
-                    for (auto& s : thenNode->statements) {
-                        compileStmt(s.get());
-                    }
-                }
+                if (auto* tn = static_cast<Block*>(ifs->thenBlock.get()))
+                    for (auto& s : tn->statements) compileStmt(s.get());
                 builder->CreateBr(endBB);
 
                 if (elseBB) {
                     builder->SetInsertPoint(elseBB);
-                    auto* elseNode = static_cast<Block*>(ifs->elseBlock.get());
-                    if (elseNode) {
-                        for (auto& s : elseNode->statements) {
-                            compileStmt(s.get());
-                        }
-                    }
+                    if (auto* en = static_cast<Block*>(ifs->elseBlock.get()))
+                        for (auto& s : en->statements) compileStmt(s.get());
                     builder->CreateBr(endBB);
                 }
 
                 builder->SetInsertPoint(endBB);
                 break;
             }
+
             case NodeType::WhileStmt: {
                 auto* ws = static_cast<const WhileStmt*>(stmt);
-                llvm::Function* func = mainFunc;
-                llvm::BasicBlock* condBB = llvm::BasicBlock::Create(context, "while_cond", func);
-                llvm::BasicBlock* bodyBB = llvm::BasicBlock::Create(context, "while_body", func);
-                llvm::BasicBlock* endBB = llvm::BasicBlock::Create(context, "while_end", func);
+                llvm::BasicBlock* condBB = llvm::BasicBlock::Create(
+                    context, "while_cond", mainFunc);
+                llvm::BasicBlock* bodyBB = llvm::BasicBlock::Create(
+                    context, "while_body", mainFunc);
+                llvm::BasicBlock* endBB  = llvm::BasicBlock::Create(
+                    context, "while_end", mainFunc);
 
                 loopStack.push_back({condBB, endBB});
-
                 builder->CreateBr(condBB);
 
                 builder->SetInsertPoint(condBB);
@@ -662,56 +732,60 @@ private:
                     break;
                 }
                 llvm::Value* condBool;
-                if (condVal->getType()->isIntegerTy()) {
-                    condBool = builder->CreateICmpNE(condVal, llvm::ConstantInt::get(condVal->getType(), 0));
-                } else if (condVal->getType()->isFloatingPointTy()) {
-                    condBool = builder->CreateFCmpONE(condVal, llvm::ConstantFP::get(condVal->getType(), 0.0));
-                } else if (condVal->getType()->isPointerTy()) {
-                    condBool = builder->CreateICmpNE(condVal, llvm::ConstantPointerNull::get(llvm::cast<llvm::PointerType>(condVal->getType())));
-                } else {
-                    condBool = builder->CreateICmpNE(condVal, llvm::ConstantInt::get(condVal->getType(), 0));
-                }
+                if (condVal->getType()->isIntegerTy())
+                    condBool = builder->CreateICmpNE(condVal,
+                        llvm::ConstantInt::get(condVal->getType(), 0));
+                else if (condVal->getType()->isFloatingPointTy())
+                    condBool = builder->CreateFCmpONE(condVal,
+                        llvm::ConstantFP::get(condVal->getType(), 0.0));
+                else if (condVal->getType()->isPointerTy())
+                    condBool = builder->CreateICmpNE(condVal,
+                        llvm::ConstantPointerNull::get(
+                            llvm::cast<llvm::PointerType>(condVal->getType())));
+                else
+                    condBool = builder->CreateICmpNE(condVal,
+                        llvm::ConstantInt::get(condVal->getType(), 0));
                 builder->CreateCondBr(condBool, bodyBB, endBB);
 
                 builder->SetInsertPoint(bodyBB);
-                auto* bodyNode = static_cast<Block*>(ws->body.get());
-                if (bodyNode) {
-                    for (auto& s : bodyNode->statements) {
-                        compileStmt(s.get());
-                    }
-                }
+                if (auto* bn = static_cast<Block*>(ws->body.get()))
+                    for (auto& s : bn->statements) compileStmt(s.get());
                 builder->CreateBr(condBB);
 
                 builder->SetInsertPoint(endBB);
                 loopStack.pop_back();
                 break;
             }
+
             case NodeType::BreakStmt: {
                 if (loopStack.empty()) {
                     llvm::errs() << "Error: 'break' outside of loop\n";
                     break;
                 }
-                auto endBB = loopStack.back().second;
-                builder->CreateBr(endBB);
-                llvm::BasicBlock* dummyBB = llvm::BasicBlock::Create(context, "break_dummy", mainFunc);
-                builder->SetInsertPoint(dummyBB);
+                builder->CreateBr(loopStack.back().second);
+                llvm::BasicBlock* dummy = llvm::BasicBlock::Create(
+                    context, "break_dummy", mainFunc);
+                builder->SetInsertPoint(dummy);
                 break;
             }
+
             case NodeType::ContinueStmt: {
                 if (loopStack.empty()) {
                     llvm::errs() << "Error: 'continue' outside of loop\n";
                     break;
                 }
-                auto condBB = loopStack.back().first;
-                builder->CreateBr(condBB);
-                llvm::BasicBlock* dummyBB = llvm::BasicBlock::Create(context, "continue_dummy", mainFunc);
-                builder->SetInsertPoint(dummyBB);
+                builder->CreateBr(loopStack.back().first);
+                llvm::BasicBlock* dummy = llvm::BasicBlock::Create(
+                    context, "continue_dummy", mainFunc);
+                builder->SetInsertPoint(dummy);
                 break;
             }
+
             case NodeType::Call: {
                 compileExpr(stmt);
                 break;
             }
+
             default:
                 break;
         }

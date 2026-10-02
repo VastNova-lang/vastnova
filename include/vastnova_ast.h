@@ -10,6 +10,7 @@ namespace vastnova {
 enum class NodeType {
     Program,
     FunctionDecl,
+    ReturnStmt,
     VarDecl,
     ConstDecl,
     Assign,
@@ -22,6 +23,7 @@ enum class NodeType {
     Number,
     StringLit,
     Variable,
+    UnaryOp,
     BinaryOp,
     Call,
     ImportStmt
@@ -38,10 +40,22 @@ struct Program : ASTNode {
     Program() : ASTNode(NodeType::Program) {}
 };
 
+struct Param {
+    std::string name;
+    std::string type;
+};
+
 struct FunctionDecl : ASTNode {
     std::string name;
+    std::vector<Param> params;
     std::unique_ptr<ASTNode> body;
+    std::string returnType;
     FunctionDecl() : ASTNode(NodeType::FunctionDecl) {}
+};
+
+struct ReturnStmt : ASTNode {
+    std::unique_ptr<ASTNode> value;
+    ReturnStmt() : ASTNode(NodeType::ReturnStmt) {}
 };
 
 struct VarDecl : ASTNode {
@@ -108,6 +122,13 @@ struct StringLiteral : ASTNode {
 struct Variable : ASTNode {
     std::string name;
     Variable(const std::string& n) : ASTNode(NodeType::Variable), name(n) {}
+};
+
+struct UnaryOp : ASTNode {
+    std::string op;
+    std::unique_ptr<ASTNode> operand;
+    UnaryOp(const std::string& o, std::unique_ptr<ASTNode> e)
+        : ASTNode(NodeType::UnaryOp), op(o), operand(std::move(e)) {}
 };
 
 struct BinaryOp : ASTNode {
