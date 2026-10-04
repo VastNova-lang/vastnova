@@ -63,18 +63,24 @@ let name = "Alice"    // type inferred as str
 
 Operators: `+` `-` `*` `/` with standard precedence (multiplication/division before addition/subtraction). Parentheses can override precedence.
 
-All arithmetic is **type‑aware**:
-- If both operands are integers, result is integer (truncating division).
-- If either operand is float, result is float.
-- String `+` performs **concatenation** (only between strings).
+A unary minus (`-`) can be applied to a number, a variable, or any parenthesized expression. Its precedence is higher than any binary operator.
 
-Examples:
 ```vastnova
 var a = 10 + 5        // 15 (i32)
 var b = 3.14 * 2      // 6.28 (f64)
 var c = 20 / 3        // 6 (integer division)
 var d = "Hello" + " " + "World"  // "Hello World" (str)
+
+var e = -5            // -5
+var f = -a            // -10
+var g = -(3 + 4)      // -7
+var h = -a * 2        // (-10) * 2 = -20
 ```
+
+All arithmetic is **type‑aware**:
+- If both operands are integers, result is integer (truncating division).
+- If either operand is float, result is float.
+- String `+` performs **concatenation** (only between strings).
 
 Note: Mixing numbers and strings in `+` is **not** allowed; use `str()` to convert numbers explicitly.
 
@@ -155,7 +161,99 @@ while i < 10 {
 
 `break` and `continue` can only appear inside a loop body; using them outside results in a compile‑time error.
 
-## 9. String Operations
+## 9. Functions
+
+Functions are declared with the `fn` keyword. Parameters must have explicit types. The return type is written after `->`; if omitted, the function returns nothing (`void`).
+
+### Declaration
+
+```vastnova
+fn name(p1 : type1, p2 : type2) -> returnType {
+    // body
+}
+```
+
+### No parameters, no return value
+
+```vastnova
+fn greet() {
+    print("Hello!")
+}
+
+greet()   // prints Hello!
+```
+
+### With parameters
+
+```vastnova
+fn greet(name : str) {
+    print("Hello,", name)
+}
+
+greet("Alice")   // Hello, Alice
+greet("Bob")     // Hello, Bob
+```
+
+### With a return value
+
+```vastnova
+fn add(a : i32, b : i32) -> i32 {
+    return a + b
+}
+
+var s = add(3, 4)
+print("3 + 4 =", s)     // 7
+```
+
+### Mixing types
+
+```vastnova
+fn square(x : f64) -> f64 {
+    return x * x
+}
+
+var r = square(2.5)
+print(r)                // 6.250000
+```
+
+### Return rules
+
+- In a non-`void` function, every path must end with `return expr`. The compiler will warn and insert a default return if a path is missing.
+- In a `void` function, use `return` (without a value) or omit it entirely. Using `return expr` inside a `void` function is an error.
+- The returned expression is automatically converted to the declared return type when possible (e.g., `i32` → `f64`).
+
+### Calling a function as an expression
+
+A call that returns a value can appear anywhere an expression is allowed:
+
+```vastnova
+var x = add(1, 2)
+print(add(x, 10))
+```
+
+A call that returns nothing can only be used as a statement:
+
+```vastnova
+greet("Alice")      // OK
+var y = greet("Alice")  // ERROR: cannot assign void
+```
+
+### Recursion
+
+Functions can call themselves or each other, because all functions are pre-declared before code is generated:
+
+```vastnova
+fn fib(n : i32) -> i32 {
+    if n < 2 {
+        return n
+    }
+    return fib(n - 1) + fib(n - 2)
+}
+
+print("fib(10) =", fib(10))   // 55
+```
+
+## 10. String Operations
 
 ### Concatenation (`+`)
 Two strings can be concatenated with `+`. The result is a newly allocated string.
@@ -189,7 +287,7 @@ print("Next year you will be", age + 1)
 
 If the argument is already a number, `int()` and `float()` simply cast it to the desired type.
 
-## 10. Variable Reassignment
+## 11. Variable Reassignment
 
 Variables declared with `var` can be reassigned at any time. The new value must be compatible with the variable's type (no implicit conversions between incompatible types).
 
@@ -201,7 +299,7 @@ x = "text"      // ERROR: type mismatch (i32 vs str)
 
 Constants (`let`) cannot be reassigned.
 
-## 11. Modules and Imports
+## 12. Modules and Imports
 
 VastNova supports a simple module system via the `import` statement.
 
@@ -237,7 +335,7 @@ if flag == true {
 }
 ```
 
-## 12. Complete Example Program
+## 13. Complete Example Program
 
 Below is a full program that uses almost every feature:
 
@@ -273,19 +371,30 @@ while i < 5 {
     print("i =", i)
     i = i + 1
 }
+
+// Function example
+fn max(a : i32, b : i32) -> i32 {
+    if a > b {
+        return a
+    } else {
+        return b
+    }
+}
+
+print("max(3, 7) =", max(3, 7))
+print("max(-5, 2) =", max(-5, 2))
 ```
 
-## 13. Errors and Limitations
+## 14. Errors and Limitations
 
 - No arrays or dictionaries yet.
-- No user‑defined functions.
-- No explicit type casting except `str()`, `int()`, `float()`.
-- All `if`/`else` and `while` blocks must use `{ }`; no single‑line shorthand.
 - No `else if` shortcut – nest `if` inside `else`.
 - String comparison only supports `==` and `!=`; `>`, `<`, `>=`, `<=` on strings are compile errors.
 - `break` and `continue` can only appear inside loops.
 - Imported files are loaded at compile time; no dynamic imports.
+- All parameters must have explicit types; return type is written after `->`.
+- No overloading: function names must be unique.
 
-## 14. Further Reading
+## 15. Further Reading
 
-For compiler internals, see the source code in the [`src/`](src/) and [`include/`](include/) directories.
+For compiler internals, see the source code in the [`src/`](../src/) and [`include/`](../include/) directories.
