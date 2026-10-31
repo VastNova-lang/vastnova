@@ -13,8 +13,11 @@
 #include <llvm/Support/Casting.h>
 #include <sstream>
 #include <map>
+#include <set>
 #include <vector>
 #include <memory>
+#include <climits>
+#include <string>
 
 namespace vastnova {
 
@@ -24,10 +27,14 @@ class LLVMCodeGen {
     std::unique_ptr<llvm::IRBuilder<>> builder;
     llvm::Function* mainFunc;
     llvm::BasicBlock* entryBB;
-    std::map<std::string, llvm::AllocaInst*> varMap;
-    std::map<std::string, llvm::Constant*> constMap;
+    // 作用域栈：每层是一个符号表。变量与常量各维护一套，
+    // 进入块（函数体/if/while）时压栈，离开时弹栈；查找从内向外。
+    std::vector<std::map<std::string, llvm::AllocaInst*>> varScopes;
+    std::vector<std::map<std::string, llvm::Constant*>> constScopes;
     std::vector<std::pair<llvm::BasicBlock*, llvm::BasicBlock*>> loopStack;
     std::string currentReturnType;
+    bool inMain = true;
+    bool hadError = false;
 
 public:
     LLVMCodeGen() : module(std::make_unique<llvm::Module>("vastnova", context)),
@@ -48,15 +55,37 @@ public:
         mainFunc = llvm::Function::Create(mainType, llvm::Function::ExternalLinkage,
                                           "main", module.get());
 
+        std::vector<const FunctionDecl*> validFuncs;
+        std::set<std::string> declaredFunctions;
+
         for (auto* f : funcs) {
+            if (f->name == "main") {
+                error("function name 'main' is reserved");
+                continue;
+            }
+            if (!declaredFunctions.insert(f->name).second) {
+                error("duplicate function '" + f->name + "'");
+                continue;
+            }
             std::vector<llvm::Type*> paramTys;
-            for (auto& p : f->params) paramTys.push_back(mapType(p.type));
+            bool badParam = false;
+            for (auto& p : f->params) {
+                if (p.type == "void") {
+                    error("parameter '" + p.name + "' of function '" + f->name +
+                          "' cannot be void");
+                    badParam = true;
+                    break;
+                }
+                paramTys.push_back(mapType(p.type));
+            }
+            if (badParam) continue;
             llvm::Type* retTy = mapType(f->returnType);
             auto* fnTy = llvm::FunctionType::get(retTy, paramTys, false);
             if (!module->getFunction(f->name)) {
                 llvm::Function::Create(fnTy, llvm::Function::ExternalLinkage,
                                        f->name, module.get());
             }
+            validFuncs.push_back(f);
         }
 
         entryBB = llvm::BasicBlock::Create(context, "entry", mainFunc);
@@ -67,33 +96,34 @@ public:
         declareStringFunctions();
 
         currentReturnType = "void";
+        inMain = true;
+        pushScope();  // 主程序作用域：变量与顶层常量
         for (auto* s : mainStmts) compileStmt(s);
         builder->CreateRet(llvm::ConstantInt::get(llvm::Type::getInt32Ty(context), 0));
+        popVarScope();  // 主程序的局部变量在函数外不可见；常量保留供函数使用
 
-        for (auto* f : funcs) {
+        inMain = false;
+        for (auto* f : validFuncs) {
             auto* fn = module->getFunction(f->name);
             auto* bb = llvm::BasicBlock::Create(context, "entry", fn);
 
-            auto savedVarMap    = std::move(varMap);
-            auto savedConstMap  = std::move(constMap);
             auto savedLoopStack = std::move(loopStack);
             auto* savedMainFunc = mainFunc;
             auto  savedRetType  = currentReturnType;
 
-            varMap.clear();
-            constMap.clear();
             loopStack.clear();
             mainFunc = fn;
             currentReturnType = f->returnType;
 
             builder->SetInsertPoint(bb);
+            pushScope();  // 函数作用域
 
             auto argIt = fn->arg_begin();
             for (auto& p : f->params) {
                 llvm::Type* pty = mapType(p.type);
                 auto* alloca = builder->CreateAlloca(pty, nullptr, p.name);
                 builder->CreateStore(&*argIt, alloca);
-                varMap[p.name] = alloca;
+                declareVar(p.name, alloca);
                 ++argIt;
             }
 
@@ -103,18 +133,25 @@ public:
             }
 
             if (!builder->GetInsertBlock()->getTerminator()) {
+                if (f->returnType != "void" &&
+                    isReachableFrom(bb, builder->GetInsertBlock())) {
+                    warn("function '" + f->name +
+                         "' may not return a value on all paths");
+                }
                 addDefaultReturn(f->returnType);
             }
 
-            varMap    = std::move(savedVarMap);
-            constMap  = std::move(savedConstMap);
+            popScope();  // 离开函数作用域
             loopStack = std::move(savedLoopStack);
             mainFunc  = savedMainFunc;
             currentReturnType = savedRetType;
         }
 
         if (llvm::verifyModule(*module, &llvm::errs())) {
-            llvm::errs() << "Module verification failed\n";
+            error("module verification failed");
+        }
+        if (hadError) {
+            throw std::runtime_error("code generation failed");
         }
 
         std::string ir;
@@ -124,6 +161,87 @@ public:
     }
 
 private:
+    void error(const std::string& msg) {
+        llvm::errs() << "Error: " << msg << "\n";
+        hadError = true;
+    }
+
+    void warn(const std::string& msg) {
+        llvm::errs() << "Warning: " << msg << "\n";
+    }
+
+    // ---- 作用域管理 ----
+    void pushVarScope()   { varScopes.emplace_back(); }
+    void popVarScope()    { if (!varScopes.empty()) varScopes.pop_back(); }
+    void pushConstScope() { constScopes.emplace_back(); }
+    void popConstScope()  { if (!constScopes.empty()) constScopes.pop_back(); }
+    void pushScope()      { pushVarScope(); pushConstScope(); }
+    void popScope()       { popVarScope(); popConstScope(); }
+
+    llvm::AllocaInst* lookupVar(const std::string& name) {
+        for (auto it = varScopes.rbegin(); it != varScopes.rend(); ++it) {
+            auto f = it->find(name);
+            if (f != it->end()) return f->second;
+        }
+        return nullptr;
+    }
+
+    llvm::Constant* lookupConst(const std::string& name) {
+        for (auto it = constScopes.rbegin(); it != constScopes.rend(); ++it) {
+            auto f = it->find(name);
+            if (f != it->end()) return f->second;
+        }
+        return nullptr;
+    }
+
+    bool declareVar(const std::string& name, llvm::AllocaInst* alloca) {
+        if (varScopes.empty()) return false;
+        auto& cur = varScopes.back();
+        if (cur.count(name)) {
+            error("variable '" + name + "' already declared in this scope");
+            return false;
+        }
+        if (!constScopes.empty() && constScopes.back().count(name)) {
+            error("'" + name + "' already declared as a constant in this scope");
+            return false;
+        }
+        cur[name] = alloca;
+        return true;
+    }
+
+    bool declareConst(const std::string& name, llvm::Constant* c) {
+        if (constScopes.empty()) return false;
+        auto& cur = constScopes.back();
+        if (cur.count(name)) {
+            error("constant '" + name + "' already declared in this scope");
+            return false;
+        }
+        if (!varScopes.empty() && varScopes.back().count(name)) {
+            error("'" + name + "' already declared as a variable in this scope");
+            return false;
+        }
+        cur[name] = c;
+        return true;
+    }
+
+
+    static bool isReachableFrom(llvm::BasicBlock* from, llvm::BasicBlock* target) {
+        std::set<llvm::BasicBlock*> visited;
+        std::vector<llvm::BasicBlock*> work;
+        work.push_back(from);
+        while (!work.empty()) {
+            auto* bb = work.back();
+            work.pop_back();
+            if (!visited.insert(bb).second) continue;
+            if (bb == target) return true;
+            auto* term = bb->getTerminator();
+            if (!term) continue;
+            for (unsigned i = 0; i < term->getNumSuccessors(); ++i)
+                work.push_back(term->getSuccessor(i));
+        }
+        return false;
+    }
+
     llvm::PointerType* getInt8PtrTy() {
         return llvm::PointerType::get(context, 0);
     }
@@ -147,11 +265,50 @@ private:
         } else if (ty->isFloatingPointTy()) {
             builder->CreateRet(llvm::ConstantFP::get(ty, 0.0));
         } else if (ty->isPointerTy()) {
-            builder->CreateRet(llvm::ConstantPointerNull::get(
-                llvm::cast<llvm::PointerType>(ty)));
+            auto* empty = builder->CreateGlobalString("", "empty_ret_str");
+            builder->CreateRet(builder->CreatePointerCast(empty, ty));
         } else {
             builder->CreateRetVoid();
         }
+    }
+
+    void storeDefaultValue(llvm::AllocaInst* alloca, llvm::Type* ty) {
+        if (ty->isIntegerTy()) {
+            builder->CreateStore(llvm::ConstantInt::get(ty, 0), alloca);
+        } else if (ty->isFloatingPointTy()) {
+            builder->CreateStore(llvm::ConstantFP::get(ty, 0.0), alloca);
+        } else if (ty->isPointerTy()) {
+            auto* empty = builder->CreateGlobalString("", "empty_str");
+            builder->CreateStore(
+                builder->CreatePointerCast(empty, getInt8PtrTy()), alloca);
+        } else {
+            error("cannot initialize a variable of this type");
+        }
+    }
+
+    llvm::Type* commonNumericType(llvm::Value* a, llvm::Value* b) {
+        if (a->getType()->isFloatingPointTy() || b->getType()->isFloatingPointTy())
+            return llvm::Type::getDoubleTy(context);
+        if (a->getType()->isIntegerTy(64) || b->getType()->isIntegerTy(64))
+            return llvm::Type::getInt64Ty(context);
+        return llvm::Type::getInt32Ty(context);
+    }
+
+    llvm::Value* toBool(llvm::Value* v) {
+        if (!v) return nullptr;
+        llvm::Type* ty = v->getType();
+        if (ty->isIntegerTy())
+            return builder->CreateICmpNE(
+                v, llvm::ConstantInt::get(ty, 0), "cond");
+        if (ty->isFloatingPointTy())
+            return builder->CreateFCmpONE(
+                v, llvm::ConstantFP::get(ty, 0.0), "fcond");
+        if (ty->isPointerTy())
+            return builder->CreateICmpNE(
+                v, llvm::ConstantPointerNull::get(
+                       llvm::cast<llvm::PointerType>(ty)), "pcond");
+        error("condition must be a number or a string");
+        return nullptr;
     }
 
     void declarePrintf() {
@@ -196,6 +353,11 @@ private:
             llvm::Type::getInt32Ty(context), snprintfArgs, true);
         module->getOrInsertFunction("snprintf", snprintfType);
 
+        std::vector<llvm::Type*> getcharArgs = {};
+        llvm::FunctionType* getcharType = llvm::FunctionType::get(
+            llvm::Type::getInt32Ty(context), getcharArgs, false);
+        module->getOrInsertFunction("getchar", getcharType);
+
         std::vector<llvm::Type*> atoiArgs = {getInt8PtrTy()};
         llvm::FunctionType* atoiType = llvm::FunctionType::get(
             llvm::Type::getInt32Ty(context), atoiArgs, false);
@@ -212,13 +374,14 @@ private:
         if (targetTy->isIntegerTy()) {
             if (val->getType()->isIntegerTy()) {
                 if (targetTy->getIntegerBitWidth() > val->getType()->getIntegerBitWidth())
-                    return builder->CreateZExt(val, targetTy);
+                    return builder->CreateSExt(val, targetTy);
                 else
                     return builder->CreateTrunc(val, targetTy);
             } else if (val->getType()->isFloatingPointTy()) {
                 return builder->CreateFPToSI(val, targetTy);
             } else if (val->getType()->isPointerTy()) {
-                return builder->CreatePtrToInt(val, targetTy);
+                error("cannot convert a string to a number");
+                return val;
             }
         } else if (targetTy->isFloatingPointTy()) {
             if (val->getType()->isIntegerTy()) {
@@ -231,13 +394,39 @@ private:
             }
         } else if (targetTy->isPointerTy()) {
             if (val->getType()->isIntegerTy()) {
-                return builder->CreateIntToPtr(val, targetTy);
+                error("cannot convert a number to a string");
+                return val;
             }
         }
         return val;
     }
 
+    llvm::Constant* convertConstant(llvm::Constant* c, llvm::Type* ty,
+                                    const std::string& name) {
+        llvm::Type* from = c->getType();
+        if (from == ty) return c;
+        if (auto* ci = llvm::dyn_cast<llvm::ConstantInt>(c)) {
+            if (ty->isIntegerTy())
+                return llvm::ConstantInt::get(ty, ci->getSExtValue(), true);
+            if (ty->isFloatingPointTy())
+                return llvm::ConstantFP::get(ty, (double)ci->getSExtValue());
+        }
+        if (auto* cf = llvm::dyn_cast<llvm::ConstantFP>(c)) {
+            if (ty->isIntegerTy())
+                return llvm::ConstantInt::get(
+                    ty, (int64_t)cf->getValueAPF().convertToDouble(), true);
+            if (ty->isFloatingPointTy())
+                return llvm::ConstantFP::get(
+                    ty, cf->getValueAPF().convertToDouble());
+        }
+        error("constant '" + name + "' has an incompatible declared type");
+        return c;
+    }
+
     llvm::Value* compileStr(llvm::Value* value) {
+        if (!value) return nullptr;
+        if (value->getType()->isPointerTy()) return value;
+
         llvm::Type* bufType = llvm::ArrayType::get(llvm::Type::getInt8Ty(context), 64);
         auto bufAlloca = builder->CreateAlloca(bufType, nullptr, "str_buf");
         auto bufPtr = builder->CreatePointerCast(bufAlloca, getInt8PtrTy());
@@ -245,11 +434,15 @@ private:
         std::string formatStr;
         if (value->getType()->isIntegerTy()) {
             formatStr = "%lld";
-            value = builder->CreateSExt(value, llvm::Type::getInt64Ty(context));
+            if (value->getType()->getIntegerBitWidth() < 64)
+                value = builder->CreateSExt(value, llvm::Type::getInt64Ty(context));
         } else if (value->getType()->isFloatingPointTy()) {
             formatStr = "%g";
+            if (value->getType()->isFloatTy())
+                value = builder->CreateFPExt(value, llvm::Type::getDoubleTy(context));
         } else {
-            return llvm::ConstantPointerNull::get(getInt8PtrTy());
+            error("str() cannot convert this value");
+            return nullptr;
         }
         auto formatG = builder->CreateGlobalString(formatStr, "str_fmt");
 
@@ -274,7 +467,10 @@ private:
     }
 
     llvm::Value* compileInt(const Call* call) {
-        if (call->args.size() != 1) return nullptr;
+        if (call->args.size() != 1) {
+            error("int() expects one argument");
+            return nullptr;
+        }
         auto arg = compileExpr(call->args[0].get());
         if (!arg) return nullptr;
         if (arg->getType()->isPointerTy()) {
@@ -283,11 +479,15 @@ private:
         } else if (arg->getType()->isIntegerTy() || arg->getType()->isFloatingPointTy()) {
             return convertValue(arg, llvm::Type::getInt32Ty(context));
         }
+        error("int() cannot convert this value");
         return nullptr;
     }
 
     llvm::Value* compileFloat(const Call* call) {
-        if (call->args.size() != 1) return nullptr;
+        if (call->args.size() != 1) {
+            error("float() expects one argument");
+            return nullptr;
+        }
         auto arg = compileExpr(call->args[0].get());
         if (!arg) return nullptr;
         if (arg->getType()->isPointerTy()) {
@@ -296,21 +496,52 @@ private:
         } else if (arg->getType()->isIntegerTy() || arg->getType()->isFloatingPointTy()) {
             return convertValue(arg, llvm::Type::getDoubleTy(context));
         }
+        error("float() cannot convert this value");
         return nullptr;
     }
 
     llvm::Value* compileInput(const Call* call) {
+        if (call->args.size() > 1) {
+            error("input() takes at most one prompt argument");
+        }
         if (!call->args.empty()) {
             auto prompt = compileExpr(call->args[0].get());
             if (prompt) {
-                builder->CreateCall(module->getFunction("printf"), {prompt});
+                if (!prompt->getType()->isPointerTy()) {
+                    error("input() prompt must be a string");
+                } else {
+                    auto promptFmt = builder->CreateGlobalString("%s", "prompt_fmt");
+                    builder->CreateCall(module->getFunction("printf"),
+                                        {promptFmt, prompt});
+                }
             }
         }
         auto bufferType = llvm::ArrayType::get(llvm::Type::getInt8Ty(context), 1024);
         auto bufferAlloca = builder->CreateAlloca(bufferType, nullptr, "input_buffer");
-        auto formatStr = builder->CreateGlobalString("%1023s", "scanf_fmt");
         auto bufferPtr = builder->CreatePointerCast(bufferAlloca, getInt8PtrTy());
+        builder->CreateStore(llvm::ConstantAggregateZero::get(bufferType), bufferAlloca);
+
+        // 读取整行：%[^\n] 读到换行前，随后用 getchar 消费剩余字符（含换行/EOF）
+        auto formatStr = builder->CreateGlobalString("%1023[^\n]", "scanf_line_fmt");
         builder->CreateCall(module->getFunction("scanf"), {formatStr, bufferPtr});
+
+        llvm::BasicBlock* consumeBB = llvm::BasicBlock::Create(
+            context, "input_consume", mainFunc);
+        llvm::BasicBlock* doneBB = llvm::BasicBlock::Create(
+            context, "input_done", mainFunc);
+        builder->CreateBr(consumeBB);
+        builder->SetInsertPoint(consumeBB);
+
+        auto* getcharFn = module->getFunction("getchar");
+        auto* ch = builder->CreateCall(getcharFn, {}, "input_char");
+        auto* isNewline = builder->CreateICmpEQ(
+            ch, llvm::ConstantInt::get(llvm::Type::getInt32Ty(context), 10), "is_nl");
+        auto* isEof = builder->CreateICmpEQ(
+            ch, llvm::ConstantInt::get(llvm::Type::getInt32Ty(context), -1), "is_eof");
+        auto* stop = builder->CreateOr(isNewline, isEof, "stop_read");
+        builder->CreateCondBr(stop, doneBB, consumeBB);
+
+        builder->SetInsertPoint(doneBB);
 
         auto strlenFn = module->getFunction("strlen");
         auto len = builder->CreateCall(strlenFn, {bufferPtr}, "strlen");
@@ -357,6 +588,10 @@ private:
                                                  std::stod(num->value));
                 } else {
                     int64_t val = std::stoll(num->value);
+                    if (val > INT32_MAX || val < INT32_MIN) {
+                        return llvm::ConstantInt::get(
+                            llvm::Type::getInt64Ty(context), val, true);
+                    }
                     return llvm::ConstantInt::get(
                         llvm::Type::getInt32Ty(context), val, true);
                 }
@@ -367,16 +602,14 @@ private:
             }
             case NodeType::Variable: {
                 auto* var = static_cast<const Variable*>(node);
-                if (constMap.count(var->name)) {
-                    return constMap[var->name];
-                }
-                auto it = varMap.find(var->name);
-                if (it != varMap.end()) {
-                    auto* alloca = it->second;
+                auto* c = lookupConst(var->name);
+                if (c) return c;
+                auto* alloca = lookupVar(var->name);
+                if (alloca) {
                     auto* ty = alloca->getAllocatedType();
                     return builder->CreateLoad(ty, alloca, var->name);
                 }
-                llvm::errs() << "Error: unknown variable '" << var->name << "'\n";
+                error("unknown variable '" + var->name + "'");
                 return nullptr;
             }
             case NodeType::UnaryOp: {
@@ -389,40 +622,85 @@ private:
                     } else if (v->getType()->isFloatingPointTy()) {
                         return builder->CreateFNeg(v, "fnegtmp");
                     } else {
-                        llvm::errs() << "Error: unary '-' cannot be applied to this type\n";
+                        error("unary '-' cannot be applied to this type");
                         return nullptr;
                     }
                 }
-                llvm::errs() << "Error: unknown unary operator '" << u->op << "'\n";
+                error("unknown unary operator '" + u->op + "'");
                 return nullptr;
             }
             case NodeType::BinaryOp: {
                 auto* bin = static_cast<const BinaryOp*>(node);
+                std::string op = bin->op;
+
+                // 逻辑运算按短路语义求值：右侧只在必要时执行
+                if (op == "&&" || op == "||") {
+                    auto left = compileExpr(bin->left.get());
+                    if (!left) return nullptr;
+                    auto* lb = toBool(left);
+                    if (!lb) return nullptr;
+                    llvm::BasicBlock* leftEndBB = builder->GetInsertBlock();
+
+                    llvm::BasicBlock* rhsBB = llvm::BasicBlock::Create(
+                        context, "logic_rhs", mainFunc);
+                    llvm::BasicBlock* endBB = llvm::BasicBlock::Create(
+                        context, "logic_end", mainFunc);
+                    if (op == "&&")
+                        builder->CreateCondBr(lb, rhsBB, endBB);
+                    else
+                        builder->CreateCondBr(lb, endBB, rhsBB);
+
+                    builder->SetInsertPoint(rhsBB);
+                    auto right = compileExpr(bin->right.get());
+                    if (!right) return nullptr;
+                    auto* rb = toBool(right);
+                    if (!rb) return nullptr;
+                    auto* rhsVal = builder->CreateZExt(
+                        rb, llvm::Type::getInt32Ty(context), "logic_zext");
+                    auto* rhsEndBB = builder->GetInsertBlock();
+                    builder->CreateBr(endBB);
+
+                    builder->SetInsertPoint(endBB);
+                    auto* phi = builder->CreatePHI(
+                        llvm::Type::getInt32Ty(context), 2, "logic_phi");
+                    phi->addIncoming(
+                        llvm::ConstantInt::get(llvm::Type::getInt32Ty(context),
+                                               op == "&&" ? 0 : 1),
+                        leftEndBB);
+                    phi->addIncoming(rhsVal, rhsEndBB);
+                    return phi;
+                }
+
                 auto left = compileExpr(bin->left.get());
                 auto right = compileExpr(bin->right.get());
                 if (!left || !right) return nullptr;
-                std::string op = bin->op;
+
+                bool leftIsPtr  = left->getType()->isPointerTy();
+                bool rightIsPtr = right->getType()->isPointerTy();
 
                 if (op == ">" || op == "<" || op == "==" || op == "!=" ||
                     op == ">=" || op == "<=") {
-                    bool leftIsPtr  = left->getType()->isPointerTy();
-                    bool rightIsPtr = right->getType()->isPointerTy();
-
                     if (leftIsPtr && rightIsPtr) {
                         if (op == "==" || op == "!=") {
-                            return callStrcmp(left, right);
+                            auto* eq = callStrcmp(left, right);
+                            if (op == "!=") {
+                                eq = builder->CreateXor(eq,
+                                    llvm::ConstantInt::get(
+                                        llvm::Type::getInt32Ty(context), 1),
+                                    "cmpnot");
+                            }
+                            return eq;
                         }
-                        llvm::errs() << "Error: string comparison with '" << op
-                                     << "' is not allowed. Use only == or != for strings.\n";
+                        error("string comparison with '" + op +
+                              "' is not allowed; use only == or !=");
+                        return nullptr;
+                    }
+                    if (leftIsPtr || rightIsPtr) {
+                        error("cannot compare a string with a non-string value");
                         return nullptr;
                     }
 
-                    llvm::Type* commonTy;
-                    if (left->getType()->isFloatingPointTy() || right->getType()->isFloatingPointTy())
-                        commonTy = llvm::Type::getDoubleTy(context);
-                    else
-                        commonTy = llvm::Type::getInt32Ty(context);
-
+                    llvm::Type* commonTy = commonNumericType(left, right);
                     left  = convertValue(left, commonTy);
                     right = convertValue(right, commonTy);
 
@@ -446,38 +724,14 @@ private:
                         llvm::Type::getInt32Ty(context), "cmp_zext");
                 }
 
-                if (op == "&&") {
-                    auto lb = builder->CreateICmpNE(left,
-                        llvm::ConstantInt::get(left->getType(), 0));
-                    auto rb = builder->CreateICmpNE(right,
-                        llvm::ConstantInt::get(right->getType(), 0));
-                    auto andVal = builder->CreateAnd(lb, rb, "andtmp");
-                    return builder->CreateZExt(andVal,
-                        llvm::Type::getInt32Ty(context), "and_zext");
-                }
-                if (op == "||") {
-                    auto lb = builder->CreateICmpNE(left,
-                        llvm::ConstantInt::get(left->getType(), 0));
-                    auto rb = builder->CreateICmpNE(right,
-                        llvm::ConstantInt::get(right->getType(), 0));
-                    auto orVal = builder->CreateOr(lb, rb, "ortmp");
-                    return builder->CreateZExt(orVal,
-                        llvm::Type::getInt32Ty(context), "or_zext");
+                if (leftIsPtr || rightIsPtr) {
+                    if (op == "+" && leftIsPtr && rightIsPtr)
+                        return concatStrings(left, right);
+                    error("operator '" + op + "' cannot be applied to a string");
+                    return nullptr;
                 }
 
-                bool stringConcat =
-                    (op == "+" &&
-                     left->getType()->isPointerTy() &&
-                     right->getType()->isPointerTy());
-                if (stringConcat) return concatStrings(left, right);
-
-                llvm::Type* commonTy;
-                if (left->getType()->isFloatingPointTy() ||
-                    right->getType()->isFloatingPointTy())
-                    commonTy = llvm::Type::getDoubleTy(context);
-                else
-                    commonTy = llvm::Type::getInt32Ty(context);
-
+                llvm::Type* commonTy = commonNumericType(left, right);
                 left  = convertValue(left, commonTy);
                 right = convertValue(right, commonTy);
 
@@ -504,7 +758,10 @@ private:
                 auto* call = static_cast<const Call*>(node);
                 if (call->name == "input") return compileInput(call);
                 if (call->name == "str") {
-                    if (call->args.size() != 1) return nullptr;
+                    if (call->args.size() != 1) {
+                        error("str() expects one argument");
+                        return nullptr;
+                    }
                     auto arg = compileExpr(call->args[0].get());
                     if (!arg) return nullptr;
                     return compileStr(arg);
@@ -514,13 +771,13 @@ private:
 
                 auto* fn = module->getFunction(call->name);
                 if (!fn) {
-                    llvm::errs() << "Error: unknown function '" << call->name << "'\n";
+                    error("unknown function '" + call->name + "'");
                     return nullptr;
                 }
                 if (call->args.size() != fn->arg_size()) {
-                    llvm::errs() << "Error: function '" << call->name << "' expects "
-                                 << fn->arg_size() << " argument(s), got "
-                                 << call->args.size() << "\n";
+                    error("function '" + call->name + "' expects " +
+                          std::to_string(fn->arg_size()) + " argument(s), got " +
+                          std::to_string(call->args.size()));
                     return nullptr;
                 }
                 std::vector<llvm::Value*> args;
@@ -548,16 +805,20 @@ private:
 
             case NodeType::ReturnStmt: {
                 auto* rs = static_cast<const ReturnStmt*>(stmt);
+                if (inMain) {
+                    error("'return' outside of a function");
+                    break;
+                }
 
                 if (currentReturnType == "void") {
                     if (rs->value) {
-                        llvm::errs() << "Error: 'return' with a value inside a void function\n";
+                        error("'return' with a value inside a void function");
                     }
                     builder->CreateRetVoid();
                 } else {
                     llvm::Type* retTy = mapType(currentReturnType);
                     if (!rs->value) {
-                        llvm::errs() << "Error: 'return' without a value inside a non-void function\n";
+                        error("'return' without a value inside a non-void function");
                         addDefaultReturn(currentReturnType);
                     } else {
                         auto v = compileExpr(rs->value.get());
@@ -580,32 +841,39 @@ private:
             case NodeType::VarDecl: {
                 auto* vd = static_cast<const VarDecl*>(stmt);
                 llvm::Type* ty = nullptr;
+                llvm::Value* initVal = nullptr;
+                bool initFailed = false;
 
-                if (!vd->type.empty()) {
-                    ty = mapType(vd->type);
-                } else if (vd->init) {
-                    auto v = compileExpr(vd->init.get());
-                    if (!v) {
-                        ty = llvm::Type::getInt32Ty(context);
-                    } else {
-                        ty = v->getType();
-                        auto* alloca = builder->CreateAlloca(ty, nullptr, vd->name);
-                        varMap[vd->name] = alloca;
-                        builder->CreateStore(v, alloca);
-                        break;
+                if (!vd->type.empty()) ty = mapType(vd->type);
+
+                if (vd->init) {
+                    initVal = compileExpr(vd->init.get());
+                    if (!initVal) {
+                        initFailed = true;
+                    } else if (initVal->getType()->isVoidTy()) {
+                        error("variable '" + vd->name +
+                              "' cannot be initialized with a void value");
+                        initVal = nullptr;
+                        initFailed = true;
+                    } else if (vd->type.empty()) {
+                        ty = initVal->getType();
                     }
-                } else {
+                }
+
+                if (!ty) ty = llvm::Type::getInt32Ty(context);
+                if (ty->isVoidTy()) {
+                    error("variable '" + vd->name + "' cannot be of type void");
                     ty = llvm::Type::getInt32Ty(context);
                 }
 
                 auto* alloca = builder->CreateAlloca(ty, nullptr, vd->name);
-                varMap[vd->name] = alloca;
-                if (vd->init) {
-                    auto val = compileExpr(vd->init.get());
-                    if (val) {
-                        if (val->getType() != ty) val = convertValue(val, ty);
-                        builder->CreateStore(val, alloca);
-                    }
+                declareVar(vd->name, alloca);
+
+                if (initVal) {
+                    if (initVal->getType() != ty) initVal = convertValue(initVal, ty);
+                    builder->CreateStore(initVal, alloca);
+                } else if (!initFailed) {
+                    storeDefaultValue(alloca, ty);
                 }
                 break;
             }
@@ -613,24 +881,46 @@ private:
             case NodeType::ConstDecl: {
                 auto* cd = static_cast<const ConstDecl*>(stmt);
                 auto val = compileExpr(cd->init.get());
-                if (val && llvm::isa<llvm::Constant>(val)) {
-                    constMap[cd->name] = llvm::cast<llvm::Constant>(val);
+                if (!val) break;
+                if (!llvm::isa<llvm::Constant>(val)) {
+                    error("initializer for constant '" + cd->name +
+                          "' is not a constant expression");
+                    break;
                 }
+                auto* c = llvm::cast<llvm::Constant>(val);
+                if (!cd->type.empty()) {
+                    llvm::Type* ty = mapType(cd->type);
+                    if (ty->isVoidTy()) {
+                        error("constant '" + cd->name + "' cannot be of type void");
+                        break;
+                    }
+                    c = convertConstant(c, ty, cd->name);
+                }
+                declareConst(cd->name, c);
                 break;
             }
 
             case NodeType::Assign: {
                 auto* as = static_cast<const Assign*>(stmt);
-                auto it = varMap.find(as->name);
-                if (it == varMap.end()) {
-                    llvm::errs() << "Error: unknown variable '" << as->name << "'\n";
+                if (lookupConst(as->name)) {
+                    error("cannot assign to constant '" + as->name + "'");
+                    break;
+                }
+                auto* alloca = lookupVar(as->name);
+                if (!alloca) {
+                    error("unknown variable '" + as->name + "'");
                     break;
                 }
                 auto val = compileExpr(as->value.get());
                 if (val) {
-                    auto* varTy = it->second->getAllocatedType();
+                    auto* varTy = alloca->getAllocatedType();
+                    if (val->getType()->isVoidTy()) {
+                        error("cannot assign a void value to variable '" +
+                              as->name + "'");
+                        break;
+                    }
                     if (val->getType() != varTy) val = convertValue(val, varTy);
-                    builder->CreateStore(val, it->second);
+                    builder->CreateStore(val, alloca);
                 }
                 break;
             }
@@ -642,14 +932,24 @@ private:
                     auto val = compileExpr(ps->args[i].get());
                     if (!val) continue;
                     std::string format;
-                    if (val->getType()->isIntegerTy())
-                        format = "%d";
-                    else if (val->getType()->isFloatingPointTy())
+                    if (val->getType()->isVoidTy()) {
+                        error("print() cannot print a void value");
+                        continue;
+                    } else if (val->getType()->isIntegerTy()) {
+                        if (val->getType()->getIntegerBitWidth() == 64)
+                            format = "%lld";
+                        else
+                            format = "%d";
+                    } else if (val->getType()->isFloatingPointTy()) {
+                        if (val->getType()->isFloatTy())
+                            val = builder->CreateFPExt(
+                                val, llvm::Type::getDoubleTy(context));
                         format = "%f";
-                    else if (val->getType()->isPointerTy())
+                    } else if (val->getType()->isPointerTy()) {
                         format = "%s";
-                    else
+                    } else {
                         format = "%p";
+                    }
 
                     auto formatStr = builder->CreateGlobalString(format, "printf_fmt");
                     builder->CreateCall(module->getFunction("printf"), {formatStr, val});
@@ -668,21 +968,8 @@ private:
                 auto* ifs = static_cast<const IfStmt*>(stmt);
                 auto condVal = compileExpr(ifs->condition.get());
                 if (!condVal) break;
-
-                llvm::Value* condBool;
-                if (condVal->getType()->isIntegerTy())
-                    condBool = builder->CreateICmpNE(condVal,
-                        llvm::ConstantInt::get(condVal->getType(), 0));
-                else if (condVal->getType()->isFloatingPointTy())
-                    condBool = builder->CreateFCmpONE(condVal,
-                        llvm::ConstantFP::get(condVal->getType(), 0.0));
-                else if (condVal->getType()->isPointerTy())
-                    condBool = builder->CreateICmpNE(condVal,
-                        llvm::ConstantPointerNull::get(
-                            llvm::cast<llvm::PointerType>(condVal->getType())));
-                else
-                    condBool = builder->CreateICmpNE(condVal,
-                        llvm::ConstantInt::get(condVal->getType(), 0));
+                llvm::Value* condBool = toBool(condVal);
+                if (!condBool) break;
 
                 llvm::BasicBlock* thenBB = llvm::BasicBlock::Create(
                     context, "if_then", mainFunc);
@@ -698,14 +985,18 @@ private:
                 }
 
                 builder->SetInsertPoint(thenBB);
+                pushScope();  // then 块作用域
                 if (auto* tn = static_cast<Block*>(ifs->thenBlock.get()))
                     for (auto& s : tn->statements) compileStmt(s.get());
+                popScope();
                 builder->CreateBr(endBB);
 
                 if (elseBB) {
                     builder->SetInsertPoint(elseBB);
+                    pushScope();  // else 块作用域
                     if (auto* en = static_cast<Block*>(ifs->elseBlock.get()))
                         for (auto& s : en->statements) compileStmt(s.get());
+                    popScope();
                     builder->CreateBr(endBB);
                 }
 
@@ -731,25 +1022,18 @@ private:
                     loopStack.pop_back();
                     break;
                 }
-                llvm::Value* condBool;
-                if (condVal->getType()->isIntegerTy())
-                    condBool = builder->CreateICmpNE(condVal,
-                        llvm::ConstantInt::get(condVal->getType(), 0));
-                else if (condVal->getType()->isFloatingPointTy())
-                    condBool = builder->CreateFCmpONE(condVal,
-                        llvm::ConstantFP::get(condVal->getType(), 0.0));
-                else if (condVal->getType()->isPointerTy())
-                    condBool = builder->CreateICmpNE(condVal,
-                        llvm::ConstantPointerNull::get(
-                            llvm::cast<llvm::PointerType>(condVal->getType())));
-                else
-                    condBool = builder->CreateICmpNE(condVal,
-                        llvm::ConstantInt::get(condVal->getType(), 0));
+                llvm::Value* condBool = toBool(condVal);
+                if (!condBool) {
+                    loopStack.pop_back();
+                    break;
+                }
                 builder->CreateCondBr(condBool, bodyBB, endBB);
 
                 builder->SetInsertPoint(bodyBB);
+                pushScope();  // 循环体作用域
                 if (auto* bn = static_cast<Block*>(ws->body.get()))
                     for (auto& s : bn->statements) compileStmt(s.get());
+                popScope();
                 builder->CreateBr(condBB);
 
                 builder->SetInsertPoint(endBB);
@@ -759,7 +1043,7 @@ private:
 
             case NodeType::BreakStmt: {
                 if (loopStack.empty()) {
-                    llvm::errs() << "Error: 'break' outside of loop\n";
+                    error("'break' outside of loop");
                     break;
                 }
                 builder->CreateBr(loopStack.back().second);
@@ -771,7 +1055,7 @@ private:
 
             case NodeType::ContinueStmt: {
                 if (loopStack.empty()) {
-                    llvm::errs() << "Error: 'continue' outside of loop\n";
+                    error("'continue' outside of loop");
                     break;
                 }
                 builder->CreateBr(loopStack.back().first);

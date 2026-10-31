@@ -89,11 +89,11 @@ int main(int argc, char* argv[]) {
             }
         }
 
-        std::string cmd = "clang " + llFile + " -o " + outputFile;
+        std::string cmd = "clang \"" + llFile + "\" -o \"" + outputFile + "\"";
         int ret = std::system(cmd.c_str());
         if (ret != 0) {
-            std::cerr << "Error: clang compilation failed (exit code " << ret << ")" << std::endl;
-            return ret;
+            std::cerr << "Error: clang compilation failed" << std::endl;
+            return 1;
         }
 
         std::cout << "Executable created: " << outputFile << std::endl;

@@ -116,8 +116,19 @@ public:
                 i++;
                 while (i < src.size() && src[i] != '"') {
                     if (src[i] == '\\' && i + 1 < src.size()) {
-                        str += src[i++];
-                        str += src[i++];
+                        char esc = src[i + 1];
+                        switch (esc) {
+                            case 'n':  str += '\n'; i += 2; break;
+                            case 't':  str += '\t'; i += 2; break;
+                            case 'r':  str += '\r'; i += 2; break;
+                            case '0':  str += '\0'; i += 2; break;
+                            case '\\': str += '\\'; i += 2; break;
+                            case '"':  str += '"';  i += 2; break;
+                            default:
+                                str += src[i++];
+                                str += src[i++];
+                                break;
+                        }
                     } else {
                         str += src[i++];
                     }

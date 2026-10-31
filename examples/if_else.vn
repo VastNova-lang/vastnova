@@ -3,10 +3,12 @@ var score = int(input("Enter your score: "))
 
 if score >= 90 {
     print("Excellent!")
-} else if score >= 60 {
-    print("Pass")
 } else {
-    print("Fail")
+    if score >= 60 {
+        print("Pass")
+    } else {
+        print("Fail")
+    }
 }
 
 // Nested if with logical operators
