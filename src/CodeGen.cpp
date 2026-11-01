@@ -346,6 +346,13 @@ private:
             llvm::Type::getInt64Ty(context), strlenArgs, false);
         module->getOrInsertFunction("strlen", strlenType);
 
+        std::vector<llvm::Type*> reallocArgs = {
+            getInt8PtrTy(), llvm::Type::getInt64Ty(context)
+        };
+        llvm::FunctionType* reallocType = llvm::FunctionType::get(
+            getInt8PtrTy(), reallocArgs, false);
+        module->getOrInsertFunction("realloc", reallocType);
+
         std::vector<llvm::Type*> snprintfArgs = {
             getInt8PtrTy(), llvm::Type::getInt64Ty(context), getInt8PtrTy()
         };
@@ -516,42 +523,82 @@ private:
                 }
             }
         }
-        auto bufferType = llvm::ArrayType::get(llvm::Type::getInt8Ty(context), 1024);
-        auto bufferAlloca = builder->CreateAlloca(bufferType, nullptr, "input_buffer");
-        auto bufferPtr = builder->CreatePointerCast(bufferAlloca, getInt8PtrTy());
-        builder->CreateStore(llvm::ConstantAggregateZero::get(bufferType), bufferAlloca);
-
-        // 读取整行：%[^\n] 读到换行前，随后用 getchar 消费剩余字符（含换行/EOF）
-        auto formatStr = builder->CreateGlobalString("%1023[^\n]", "scanf_line_fmt");
-        builder->CreateCall(module->getFunction("scanf"), {formatStr, bufferPtr});
-
-        llvm::BasicBlock* consumeBB = llvm::BasicBlock::Create(
-            context, "input_consume", mainFunc);
-        llvm::BasicBlock* doneBB = llvm::BasicBlock::Create(
-            context, "input_done", mainFunc);
-        builder->CreateBr(consumeBB);
-        builder->SetInsertPoint(consumeBB);
-
+        // 逐字符读取整行，缓冲区按需增长，不再有固定长度上限
+        auto* i64Ty = llvm::Type::getInt64Ty(context);
+        auto* i32Ty = llvm::Type::getInt32Ty(context);
+        auto* initCap = llvm::ConstantInt::get(i64Ty, 1024);
+        auto* mallocFn = module->getFunction("malloc");
+        auto* reallocFn = module->getFunction("realloc");
         auto* getcharFn = module->getFunction("getchar");
+        auto* buf0 = builder->CreateCall(mallocFn, {initCap}, "input_buf");
+
+        llvm::BasicBlock* preBB   = builder->GetInsertBlock();
+        llvm::BasicBlock* headBB  = llvm::BasicBlock::Create(
+            context, "input_read", mainFunc);
+        llvm::BasicBlock* checkBB = llvm::BasicBlock::Create(
+            context, "input_check", mainFunc);
+        llvm::BasicBlock* growBB  = llvm::BasicBlock::Create(
+            context, "input_grow", mainFunc);
+        llvm::BasicBlock* storeBB = llvm::BasicBlock::Create(
+            context, "input_store", mainFunc);
+        llvm::BasicBlock* doneBB  = llvm::BasicBlock::Create(
+            context, "input_done", mainFunc);
+        builder->CreateBr(headBB);
+
+        builder->SetInsertPoint(headBB);
+        auto* idxPhi = builder->CreatePHI(i64Ty, 2, "input_idx");
+        auto* bufPhi = builder->CreatePHI(getInt8PtrTy(), 2, "input_ptr");
+        auto* capPhi = builder->CreatePHI(i64Ty, 2, "input_cap");
+        idxPhi->addIncoming(llvm::ConstantInt::get(i64Ty, 0), preBB);
+        bufPhi->addIncoming(buf0, preBB);
+        capPhi->addIncoming(initCap, preBB);
+
         auto* ch = builder->CreateCall(getcharFn, {}, "input_char");
         auto* isNewline = builder->CreateICmpEQ(
-            ch, llvm::ConstantInt::get(llvm::Type::getInt32Ty(context), 10), "is_nl");
+            ch, llvm::ConstantInt::get(i32Ty, 10), "is_nl");
         auto* isEof = builder->CreateICmpEQ(
-            ch, llvm::ConstantInt::get(llvm::Type::getInt32Ty(context), -1), "is_eof");
+            ch, llvm::ConstantInt::get(i32Ty, -1), "is_eof");
         auto* stop = builder->CreateOr(isNewline, isEof, "stop_read");
-        builder->CreateCondBr(stop, doneBB, consumeBB);
+        builder->CreateCondBr(stop, doneBB, checkBB);
+
+        // 留一个字节给结尾的 '\0'，容量不足则扩容
+        builder->SetInsertPoint(checkBB);
+        auto* capMinusOne = builder->CreateSub(
+            capPhi, llvm::ConstantInt::get(i64Ty, 1), "cap_last");
+        auto* needGrow = builder->CreateICmpUGE(idxPhi, capMinusOne, "need_grow");
+        builder->CreateCondBr(needGrow, growBB, storeBB);
+
+        builder->SetInsertPoint(growBB);
+        auto* newCap = builder->CreateMul(
+            capPhi, llvm::ConstantInt::get(i64Ty, 2), "new_cap");
+        auto* newBuf = builder->CreateCall(reallocFn, {bufPhi, newCap}, "input_realloc");
+        builder->CreateBr(storeBB);
+
+        builder->SetInsertPoint(storeBB);
+        auto* storeBufPhi = builder->CreatePHI(getInt8PtrTy(), 2, "store_buf");
+        auto* storeCapPhi = builder->CreatePHI(i64Ty, 2, "store_cap");
+        storeBufPhi->addIncoming(bufPhi, checkBB);
+        storeBufPhi->addIncoming(newBuf, growBB);
+        storeCapPhi->addIncoming(capPhi, checkBB);
+        storeCapPhi->addIncoming(newCap, growBB);
+
+        auto* slot = builder->CreateInBoundsGEP(
+            llvm::Type::getInt8Ty(context), storeBufPhi, idxPhi, "input_slot");
+        builder->CreateStore(builder->CreateTrunc(ch, llvm::Type::getInt8Ty(context)), slot);
+        auto* nextIdx = builder->CreateAdd(
+            idxPhi, llvm::ConstantInt::get(i64Ty, 1), "idx_next");
+        builder->CreateBr(headBB);
+
+        idxPhi->addIncoming(nextIdx, storeBB);
+        bufPhi->addIncoming(storeBufPhi, storeBB);
+        capPhi->addIncoming(storeCapPhi, storeBB);
 
         builder->SetInsertPoint(doneBB);
-
-        auto strlenFn = module->getFunction("strlen");
-        auto len = builder->CreateCall(strlenFn, {bufferPtr}, "strlen");
-        auto plusOne = builder->CreateAdd(len,
-            llvm::ConstantInt::get(llvm::Type::getInt64Ty(context), 1));
-        auto mallocFn = module->getFunction("malloc");
-        auto result = builder->CreateCall(mallocFn, {plusOne}, "strdup_result");
-        auto strcpyFn = module->getFunction("strcpy");
-        builder->CreateCall(strcpyFn, {result, bufferPtr});
-        return result;
+        auto* endSlot = builder->CreateInBoundsGEP(
+            llvm::Type::getInt8Ty(context), bufPhi, idxPhi, "input_end");
+        builder->CreateStore(
+            llvm::ConstantInt::get(llvm::Type::getInt8Ty(context), 0), endSlot);
+        return bufPhi;
     }
 
     llvm::Value* concatStrings(llvm::Value* left, llvm::Value* right) {
