@@ -44,7 +44,7 @@ For more examples, see the [examples/](examples/) directory.
 
 ## Documentation
 
-For language syntax, compiler internals, and contribution guidelines, see the [Docs/](Docs/) folder.
+For language syntax, compiler internals, and contribution guidelines, see the [language reference](Docs/docs.md).
 
 ## License
 

@@ -31,13 +31,16 @@ static inline bool isExpressionStart(const Token& t) {
             t.value == "int"   || t.value == "float")
             return true;
     }
-    if (t.type == Token::Symbol && (t.value == "(" || t.value == "-"))
+    if (t.type == Token::Symbol && (t.value == "(" || t.value == "-" || t.value == "["))
         return true;
     return false;
 }
 static inline bool isTypeKeyword(const std::string& s) {
     return s == "i32" || s == "i64" || s == "f32" || s == "f64" ||
            s == "str" || s == "void";
+}
+static inline bool isArrayTypeName(const std::string& s) {
+    return s.find('[') != std::string::npos;
 }
 
 class Tokenizer {
@@ -215,6 +218,10 @@ class Parser {
     std::unique_ptr<ASTNode> parseExpression();
     std::unique_ptr<ASTNode> parseUnary();
     std::unique_ptr<ASTNode> parsePrimary();
+    std::unique_ptr<ASTNode> parsePostfix();
+    std::unique_ptr<ASTNode> parseIndexChain(std::unique_ptr<ASTNode> base);
+    std::unique_ptr<ASTNode> parseArrayLiteral();
+    std::string parseTypeName();
     std::unique_ptr<ASTNode> parseBinaryOp(int minPrec);
     std::unique_ptr<ASTNode> parseCondition();
     std::unique_ptr<ASTNode> parseStatement();
@@ -234,6 +241,61 @@ int getPrecedence(const std::string& op) {
     return -1;
 }
 
+std::unique_ptr<ASTNode> Parser::parseArrayLiteral() {
+    auto lit = std::make_unique<ArrayLiteral>();
+    if (!matchSymbol("[")) throw std::runtime_error("Expected '['");
+    if (!matchSymbol("]")) {
+        while (true) {
+            lit->elements.push_back(parseExpression());
+            if (matchSymbol(",")) continue;
+            if (matchSymbol("]")) break;
+            throw std::runtime_error("Expected ',' or ']' in array literal");
+        }
+    }
+    return lit;
+}
+
+std::unique_ptr<ASTNode> Parser::parseIndexChain(std::unique_ptr<ASTNode> base) {
+    while (matchSymbol("[")) {
+        auto index = parseExpression();
+        if (!matchSymbol("]")) throw std::runtime_error("Expected ']' after index");
+        base = std::make_unique<IndexExpr>(std::move(base), std::move(index));
+    }
+    return base;
+}
+
+std::unique_ptr<ASTNode> Parser::parsePostfix() {
+    auto expr = parsePrimary();
+    if (current().type == Token::Symbol && current().value == "[")
+        return parseIndexChain(std::move(expr));
+    return expr;
+}
+
+std::string Parser::parseTypeName() {
+    if (current().type != Token::Keyword || !isTypeKeyword(current().value))
+        throw std::runtime_error("Expected type");
+    std::string typeName = current().value;
+    advance();
+    if (matchSymbol("[")) {
+        if (current().type != Token::Number) {
+            throw std::runtime_error("Expected array length");
+        }
+        std::string len = current().value;
+        for (char c : len) {
+            if (!std::isdigit(c))
+                throw std::runtime_error("Array length must be a positive integer");
+        }
+        if (len == "0") throw std::runtime_error("Array length must be greater than zero");
+        advance();
+        if (!matchSymbol("]"))
+            throw std::runtime_error("Expected ']' after array length");
+        if (current().type == Token::Symbol && current().value == "[")
+            throw std::runtime_error("Nested arrays are not supported");
+        typeName += "[" + len + "]";
+    }
+    return typeName;
+}
+
 std::unique_ptr<ASTNode> Parser::parsePrimary() {
     Token tok = current();
     if (tok.type == Token::Number) {
@@ -245,6 +307,9 @@ std::unique_ptr<ASTNode> Parser::parsePrimary() {
         auto str = std::make_unique<StringLiteral>(tok.value);
         advance();
         return str;
+    }
+    if (tok.type == Token::Symbol && tok.value == "[") {
+        return parseArrayLiteral();
     }
     if (tok.type == Token::Ident) {
         std::string name = tok.value;
@@ -324,7 +389,7 @@ std::unique_ptr<ASTNode> Parser::parseUnary() {
         auto operand = parseUnary();
         return std::make_unique<UnaryOp>("-", std::move(operand));
     }
-    return parsePrimary();
+    return parsePostfix();
 }
 
 std::unique_ptr<ASTNode> Parser::parseBinaryOp(int minPrec) {
@@ -395,10 +460,9 @@ std::unique_ptr<ASTNode> Parser::parseStatement() {
                 advance();
                 if (!matchSymbol(":"))
                     throw std::runtime_error("Expected ':' after parameter name");
-                if (current().type != Token::Keyword || !isTypeKeyword(current().value))
-                    throw std::runtime_error("Expected type after ':' in parameter");
-                p.type = current().value;
-                advance();
+                p.type = parseTypeName();
+                if (isArrayTypeName(p.type))
+                    throw std::runtime_error("Array types are not supported as parameter types");
                 fn->params.push_back(p);
                 if (matchSymbol(",")) continue;
                 if (matchSymbol(")")) break;
@@ -408,10 +472,9 @@ std::unique_ptr<ASTNode> Parser::parseStatement() {
 
         fn->returnType = "void";
         if (matchSymbol("->")) {
-            if (current().type != Token::Keyword || !isTypeKeyword(current().value))
-                throw std::runtime_error("Expected type after '->'");
-            fn->returnType = current().value;
-            advance();
+            fn->returnType = parseTypeName();
+            if (isArrayTypeName(fn->returnType))
+                throw std::runtime_error("Array types are not supported as return types");
         }
 
         fn->body = parseBlock();
@@ -433,10 +496,7 @@ std::unique_ptr<ASTNode> Parser::parseStatement() {
         auto varDecl = std::make_unique<VarDecl>();
         varDecl->name = name;
         if (matchSymbol(":")) {
-            if (current().type != Token::Keyword || !isTypeKeyword(current().value))
-                throw std::runtime_error("Expected type after ':'");
-            varDecl->type = current().value;
-            advance();
+            varDecl->type = parseTypeName();
         }
         if (matchSymbol("=")) {
             varDecl->init = parseExpression();
@@ -451,10 +511,7 @@ std::unique_ptr<ASTNode> Parser::parseStatement() {
         auto constDecl = std::make_unique<ConstDecl>();
         constDecl->name = name;
         if (matchSymbol(":")) {
-            if (current().type != Token::Keyword || !isTypeKeyword(current().value))
-                throw std::runtime_error("Expected type after ':'");
-            constDecl->type = current().value;
-            advance();
+            constDecl->type = parseTypeName();
         }
         if (!matchSymbol("=")) throw std::runtime_error("Expected '=' after constant declaration");
         constDecl->init = parseExpression();
@@ -503,6 +560,15 @@ std::unique_ptr<ASTNode> Parser::parseStatement() {
     if (tok.type == Token::Ident) {
         std::string name = tok.value;
         advance();
+        if (current().type == Token::Symbol && current().value == "[") {
+            auto target = parseIndexChain(std::make_unique<Variable>(name));
+            if (!matchSymbol("="))
+                throw std::runtime_error("Expected '=' after indexed assignment target");
+            auto assign = std::make_unique<Assign>();
+            assign->target = std::move(target);
+            assign->value = parseExpression();
+            return assign;
+        }
         if (matchSymbol("=")) {
             auto assign = std::make_unique<Assign>();
             assign->name = name;
@@ -654,9 +720,32 @@ void printAST(const ASTNode* node, int indent = 0) {
         }
         case NodeType::Assign: {
             auto a = static_cast<const Assign*>(node);
-            std::cout << prefix << "Assign: " << a->name << " = ";
+            if (a->target) {
+                std::cout << prefix << "Assign: ";
+                printAST(a->target.get(), 0);
+            } else {
+                std::cout << prefix << "Assign: " << a->name;
+            }
+            std::cout << " = ";
             printAST(a->value.get(), 0);
             std::cout << "\n";
+            break;
+        }
+        case NodeType::ArrayLiteral: {
+            auto a = static_cast<const ArrayLiteral*>(node);
+            std::cout << prefix << "Array[";
+            for (size_t i = 0; i < a->elements.size(); ++i) {
+                if (i > 0) std::cout << ", ";
+                printAST(a->elements[i].get(), 0);
+            }
+            std::cout << "]\n";
+            break;
+        }
+        case NodeType::IndexExpr: {
+            auto i = static_cast<const IndexExpr*>(node);
+            std::cout << prefix << "Index:\n";
+            printAST(i->base.get(), indent + 1);
+            printAST(i->index.get(), indent + 1);
             break;
         }
         case NodeType::PrintStmt: {

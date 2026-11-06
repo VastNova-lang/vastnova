@@ -26,7 +26,9 @@ enum class NodeType {
     UnaryOp,
     BinaryOp,
     Call,
-    ImportStmt
+    ImportStmt,
+    ArrayLiteral,
+    IndexExpr
 };
 
 struct ASTNode {
@@ -74,6 +76,7 @@ struct ConstDecl : ASTNode {
 
 struct Assign : ASTNode {
     std::string name;
+    std::unique_ptr<ASTNode> target;
     std::unique_ptr<ASTNode> value;
     Assign() : ASTNode(NodeType::Assign) {}
 };
@@ -148,6 +151,18 @@ struct Call : ASTNode {
 struct ImportStmt : ASTNode {
     std::string path;
     ImportStmt() : ASTNode(NodeType::ImportStmt) {}
+};
+
+struct ArrayLiteral : ASTNode {
+    std::vector<std::unique_ptr<ASTNode>> elements;
+    ArrayLiteral() : ASTNode(NodeType::ArrayLiteral) {}
+};
+
+struct IndexExpr : ASTNode {
+    std::unique_ptr<ASTNode> base;
+    std::unique_ptr<ASTNode> index;
+    IndexExpr(std::unique_ptr<ASTNode> b, std::unique_ptr<ASTNode> i)
+        : ASTNode(NodeType::IndexExpr), base(std::move(b)), index(std::move(i)) {}
 };
 
 } // namespace vastnova

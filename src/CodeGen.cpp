@@ -27,8 +27,6 @@ class LLVMCodeGen {
     std::unique_ptr<llvm::IRBuilder<>> builder;
     llvm::Function* mainFunc;
     llvm::BasicBlock* entryBB;
-    // 作用域栈：每层是一个符号表。变量与常量各维护一套，
-    // 进入块（函数体/if/while）时压栈，离开时弹栈；查找从内向外。
     std::vector<std::map<std::string, llvm::AllocaInst*>> varScopes;
     std::vector<std::map<std::string, llvm::Constant*>> constScopes;
     std::vector<std::pair<llvm::BasicBlock*, llvm::BasicBlock*>> loopStack;
@@ -97,10 +95,10 @@ public:
 
         currentReturnType = "void";
         inMain = true;
-        pushScope();  // 主程序作用域：变量与顶层常量
+        pushScope();
         for (auto* s : mainStmts) compileStmt(s);
         builder->CreateRet(llvm::ConstantInt::get(llvm::Type::getInt32Ty(context), 0));
-        popVarScope();  // 主程序的局部变量在函数外不可见；常量保留供函数使用
+        popVarScope();
 
         inMain = false;
         for (auto* f : validFuncs) {
@@ -116,7 +114,7 @@ public:
             currentReturnType = f->returnType;
 
             builder->SetInsertPoint(bb);
-            pushScope();  // 函数作用域
+            pushScope();
 
             auto argIt = fn->arg_begin();
             for (auto& p : f->params) {
@@ -141,7 +139,7 @@ public:
                 addDefaultReturn(f->returnType);
             }
 
-            popScope();  // 离开函数作用域
+            popScope();
             loopStack = std::move(savedLoopStack);
             mainFunc  = savedMainFunc;
             currentReturnType = savedRetType;
@@ -170,7 +168,6 @@ private:
         llvm::errs() << "Warning: " << msg << "\n";
     }
 
-    // ---- 作用域管理 ----
     void pushVarScope()   { varScopes.emplace_back(); }
     void popVarScope()    { if (!varScopes.empty()) varScopes.pop_back(); }
     void pushConstScope() { constScopes.emplace_back(); }
@@ -246,7 +243,22 @@ private:
         return llvm::PointerType::get(context, 0);
     }
 
+    static bool splitArrayTypeName(const std::string& t, std::string& elem,
+                                   unsigned& count) {
+        size_t open = t.find('[');
+        if (open == std::string::npos) return false;
+        size_t close = t.find(']', open);
+        if (close == std::string::npos) return false;
+        elem = t.substr(0, open);
+        count = static_cast<unsigned>(std::stoul(t.substr(open + 1, close - open - 1)));
+        return true;
+    }
+
     llvm::Type* mapType(const std::string& t) {
+        std::string elem;
+        unsigned count = 0;
+        if (splitArrayTypeName(t, elem, count))
+            return llvm::ArrayType::get(mapType(elem), count);
         if (t == "i32")  return llvm::Type::getInt32Ty(context);
         if (t == "i64")  return llvm::Type::getInt64Ty(context);
         if (t == "f32")  return llvm::Type::getFloatTy(context);
@@ -281,6 +293,8 @@ private:
             auto* empty = builder->CreateGlobalString("", "empty_str");
             builder->CreateStore(
                 builder->CreatePointerCast(empty, getInt8PtrTy()), alloca);
+        } else if (ty->isArrayTy()) {
+            builder->CreateStore(llvm::ConstantAggregateZero::get(ty), alloca);
         } else {
             error("cannot initialize a variable of this type");
         }
@@ -378,6 +392,10 @@ private:
 
     llvm::Value* convertValue(llvm::Value* val, llvm::Type* targetTy) {
         if (val->getType() == targetTy) return val;
+        if (val->getType()->isArrayTy() || targetTy->isArrayTy()) {
+            error("array values cannot be converted");
+            return val;
+        }
         if (targetTy->isIntegerTy()) {
             if (val->getType()->isIntegerTy()) {
                 if (targetTy->getIntegerBitWidth() > val->getType()->getIntegerBitWidth())
@@ -523,7 +541,6 @@ private:
                 }
             }
         }
-        // 逐字符读取整行，缓冲区按需增长，不再有固定长度上限
         auto* i64Ty = llvm::Type::getInt64Ty(context);
         auto* i32Ty = llvm::Type::getInt32Ty(context);
         auto* initCap = llvm::ConstantInt::get(i64Ty, 1024);
@@ -561,7 +578,6 @@ private:
         auto* stop = builder->CreateOr(isNewline, isEof, "stop_read");
         builder->CreateCondBr(stop, doneBB, checkBB);
 
-        // 留一个字节给结尾的 '\0'，容量不足则扩容
         builder->SetInsertPoint(checkBB);
         auto* capMinusOne = builder->CreateSub(
             capPhi, llvm::ConstantInt::get(i64Ty, 1), "cap_last");
@@ -626,6 +642,109 @@ private:
         return builder->CreateZExt(cmpZero, llvm::Type::getInt32Ty(context));
     }
 
+    llvm::Type* mergeElementType(llvm::Type* acc, llvm::Type* ty) {
+        if (!acc) return ty;
+        if (acc->isPointerTy() || ty->isPointerTy())
+            return acc->isPointerTy() && ty->isPointerTy() ? acc : nullptr;
+        if (acc->isFloatingPointTy() || ty->isFloatingPointTy()) {
+            llvm::Type* f = acc->isFloatingPointTy() ? acc : ty;
+            llvm::Type* other = acc->isFloatingPointTy() ? ty : acc;
+            if (other->isFloatingPointTy() &&
+                other->getFPMantissaWidth() > f->getFPMantissaWidth())
+                f = other;
+            return f;
+        }
+        if (acc->isIntegerTy(64) || ty->isIntegerTy(64))
+            return llvm::Type::getInt64Ty(context);
+        return llvm::Type::getInt32Ty(context);
+    }
+
+    static std::string targetVarName(const ASTNode* node) {
+        if (node->type == NodeType::Variable)
+            return static_cast<const Variable*>(node)->name;
+        if (node->type == NodeType::IndexExpr)
+            return targetVarName(static_cast<const IndexExpr*>(node)->base.get());
+        return "";
+    }
+
+    llvm::Value* compileLValue(const ASTNode* node, llvm::Type** outTy) {
+        if (node->type == NodeType::Variable) {
+            auto* var = static_cast<const Variable*>(node);
+            if (lookupConst(var->name)) {
+                error("cannot modify constant '" + var->name + "'");
+                return nullptr;
+            }
+            auto* alloca = lookupVar(var->name);
+            if (!alloca) {
+                error("unknown variable '" + var->name + "'");
+                return nullptr;
+            }
+            *outTy = alloca->getAllocatedType();
+            return alloca;
+        }
+        if (node->type == NodeType::IndexExpr) {
+            auto* ix = static_cast<const IndexExpr*>(node);
+            llvm::Type* baseTy = nullptr;
+            auto* basePtr = compileLValue(ix->base.get(), &baseTy);
+            if (!basePtr) return nullptr;
+            if (!baseTy->isArrayTy()) {
+                error("cannot index a non-array value");
+                return nullptr;
+            }
+            auto index = compileExpr(ix->index.get());
+            if (!index) return nullptr;
+            if (!index->getType()->isIntegerTy()) {
+                error("array index must be an integer");
+                return nullptr;
+            }
+            *outTy = baseTy->getArrayElementType();
+            return builder->CreateInBoundsGEP(
+                baseTy, basePtr,
+                {llvm::ConstantInt::get(llvm::Type::getInt32Ty(context), 0), index},
+                "elem_ptr");
+        }
+        error("invalid assignment target");
+        return nullptr;
+    }
+
+    llvm::Value* buildArrayInitializer(const ArrayLiteral* lit, llvm::Type* arrTy,
+                                       const std::string& name, bool& failed) {
+        auto* elemTy = arrTy->getArrayElementType();
+        std::vector<llvm::Value*> elems;
+        for (auto& e : lit->elements) {
+            auto v = compileExpr(e.get());
+            if (!v) { failed = true; return nullptr; }
+            if (v->getType()->isVoidTy() || v->getType()->isArrayTy()) {
+                error("invalid element in the initializer of array '" + name + "'");
+                failed = true;
+                return nullptr;
+            }
+            if (v->getType() != elemTy) {
+                v = convertValue(v, elemTy);
+                if (v->getType() != elemTy) { failed = true; return nullptr; }
+            }
+            elems.push_back(v);
+        }
+
+        bool allConstant = true;
+        for (auto* v : elems)
+            if (!llvm::isa<llvm::Constant>(v)) allConstant = false;
+
+        if (allConstant) {
+            std::vector<llvm::Constant*> consts;
+            for (auto* v : elems) consts.push_back(llvm::cast<llvm::Constant>(v));
+            return llvm::ConstantArray::get(
+                llvm::cast<llvm::ArrayType>(arrTy), consts);
+        }
+
+        llvm::Value* agg = llvm::UndefValue::get(arrTy);
+        for (size_t i = 0; i < elems.size(); ++i) {
+            agg = builder->CreateInsertValue(
+                agg, elems[i], {static_cast<unsigned>(i)}, "elem_init");
+        }
+        return agg;
+    }
+
     llvm::Value* compileExpr(const ASTNode* node) {
         switch (node->type) {
             case NodeType::Number: {
@@ -654,9 +773,24 @@ private:
                 auto* alloca = lookupVar(var->name);
                 if (alloca) {
                     auto* ty = alloca->getAllocatedType();
+                    if (ty->isArrayTy()) {
+                        error("array '" + var->name +
+                              "' cannot be used as a value; index it instead");
+                        return nullptr;
+                    }
                     return builder->CreateLoad(ty, alloca, var->name);
                 }
                 error("unknown variable '" + var->name + "'");
+                return nullptr;
+            }
+            case NodeType::IndexExpr: {
+                llvm::Type* elemTy = nullptr;
+                auto* ptr = compileLValue(node, &elemTy);
+                if (!ptr) return nullptr;
+                return builder->CreateLoad(elemTy, ptr, "elem");
+            }
+            case NodeType::ArrayLiteral: {
+                error("an array literal can only be used to initialize a variable");
                 return nullptr;
             }
             case NodeType::UnaryOp: {
@@ -680,7 +814,6 @@ private:
                 auto* bin = static_cast<const BinaryOp*>(node);
                 std::string op = bin->op;
 
-                // 逻辑运算按短路语义求值：右侧只在必要时执行
                 if (op == "&&" || op == "||") {
                     auto left = compileExpr(bin->left.get());
                     if (!left) return nullptr;
@@ -893,17 +1026,67 @@ private:
 
                 if (!vd->type.empty()) ty = mapType(vd->type);
 
-                if (vd->init) {
-                    initVal = compileExpr(vd->init.get());
-                    if (!initVal) {
+                if (vd->init && vd->init->type == NodeType::ArrayLiteral) {
+                    auto* lit = static_cast<const ArrayLiteral*>(vd->init.get());
+                    if (ty && !ty->isArrayTy()) {
+                        error("variable '" + vd->name + "' of type '" + vd->type +
+                              "' cannot be initialized with an array literal");
                         initFailed = true;
-                    } else if (initVal->getType()->isVoidTy()) {
-                        error("variable '" + vd->name +
-                              "' cannot be initialized with a void value");
-                        initVal = nullptr;
+                    } else if (lit->elements.empty()) {
+                        error("array literal for '" + vd->name + "' cannot be empty");
                         initFailed = true;
-                    } else if (vd->type.empty()) {
-                        ty = initVal->getType();
+                    } else if (ty && lit->elements.size() !=
+                                     ty->getArrayNumElements()) {
+                        error("array '" + vd->name + "' expects " +
+                              std::to_string(ty->getArrayNumElements()) +
+                              " element(s), but the initializer has " +
+                              std::to_string(lit->elements.size()));
+                        initFailed = true;
+                    } else if (!ty) {
+                        llvm::Type* elemTy = nullptr;
+                        for (auto& e : lit->elements) {
+                            auto v = compileExpr(e.get());
+                            if (!v) { initFailed = true; break; }
+                            if (v->getType()->isVoidTy()) {
+                                error("invalid element in the initializer of '" +
+                                      vd->name + "'");
+                                initFailed = true;
+                                break;
+                            }
+                            auto* merged = mergeElementType(elemTy, v->getType());
+                            if (!merged) {
+                                error("array literal for '" + vd->name +
+                                      "' mixes strings and numbers");
+                                initFailed = true;
+                                break;
+                            }
+                            elemTy = merged;
+                        }
+                        if (!initFailed) {
+                            ty = llvm::ArrayType::get(elemTy,
+                                                      lit->elements.size());
+                        }
+                    }
+                    if (!initFailed) {
+                        initVal = buildArrayInitializer(lit, ty, vd->name, initFailed);
+                    }
+                } else if (vd->init) {
+                    if (ty && ty->isArrayTy()) {
+                        error("array '" + vd->name +
+                              "' must be initialized with an array literal");
+                        initFailed = true;
+                    } else {
+                        initVal = compileExpr(vd->init.get());
+                        if (!initVal) {
+                            initFailed = true;
+                        } else if (initVal->getType()->isVoidTy()) {
+                            error("variable '" + vd->name +
+                                  "' cannot be initialized with a void value");
+                            initVal = nullptr;
+                            initFailed = true;
+                        } else if (vd->type.empty()) {
+                            ty = initVal->getType();
+                        }
                     }
                 }
 
@@ -927,6 +1110,10 @@ private:
 
             case NodeType::ConstDecl: {
                 auto* cd = static_cast<const ConstDecl*>(stmt);
+                if (cd->init && cd->init->type == NodeType::ArrayLiteral) {
+                    error("constant arrays are not supported");
+                    break;
+                }
                 auto val = compileExpr(cd->init.get());
                 if (!val) break;
                 if (!llvm::isa<llvm::Constant>(val)) {
@@ -949,25 +1136,46 @@ private:
 
             case NodeType::Assign: {
                 auto* as = static_cast<const Assign*>(stmt);
-                if (lookupConst(as->name)) {
-                    error("cannot assign to constant '" + as->name + "'");
+                std::string name = as->target ? targetVarName(as->target.get())
+                                              : as->name;
+                if (!name.empty() && lookupConst(name)) {
+                    error("cannot assign to constant '" + name + "'");
                     break;
                 }
-                auto* alloca = lookupVar(as->name);
-                if (!alloca) {
-                    error("unknown variable '" + as->name + "'");
-                    break;
-                }
-                auto val = compileExpr(as->value.get());
-                if (val) {
-                    auto* varTy = alloca->getAllocatedType();
-                    if (val->getType()->isVoidTy()) {
-                        error("cannot assign a void value to variable '" +
-                              as->name + "'");
+
+                llvm::Type* targetTy = nullptr;
+                llvm::Value* targetPtr = nullptr;
+                if (as->target) {
+                    targetPtr = compileLValue(as->target.get(), &targetTy);
+                } else {
+                    auto* alloca = lookupVar(as->name);
+                    if (!alloca) {
+                        error("unknown variable '" + as->name + "'");
                         break;
                     }
-                    if (val->getType() != varTy) val = convertValue(val, varTy);
-                    builder->CreateStore(val, alloca);
+                    targetTy = alloca->getAllocatedType();
+                    if (targetTy->isArrayTy()) {
+                        error("cannot assign to array '" + as->name +
+                              "' as a whole; assign one element instead");
+                        break;
+                    }
+                    targetPtr = alloca;
+                }
+                if (!targetPtr) break;
+
+                auto val = compileExpr(as->value.get());
+                if (val) {
+                    if (val->getType()->isVoidTy()) {
+                        error("cannot assign a void value to '" + name + "'");
+                        break;
+                    }
+                    if (val->getType()->isArrayTy()) {
+                        error("cannot assign an array value to '" + name +
+                              "'; assign one element instead");
+                        break;
+                    }
+                    if (val->getType() != targetTy) val = convertValue(val, targetTy);
+                    builder->CreateStore(val, targetPtr);
                 }
                 break;
             }
@@ -1032,7 +1240,7 @@ private:
                 }
 
                 builder->SetInsertPoint(thenBB);
-                pushScope();  // then 块作用域
+                pushScope();
                 if (auto* tn = static_cast<Block*>(ifs->thenBlock.get()))
                     for (auto& s : tn->statements) compileStmt(s.get());
                 popScope();
@@ -1040,7 +1248,7 @@ private:
 
                 if (elseBB) {
                     builder->SetInsertPoint(elseBB);
-                    pushScope();  // else 块作用域
+                    pushScope();
                     if (auto* en = static_cast<Block*>(ifs->elseBlock.get()))
                         for (auto& s : en->statements) compileStmt(s.get());
                     popScope();
@@ -1077,7 +1285,7 @@ private:
                 builder->CreateCondBr(condBool, bodyBB, endBB);
 
                 builder->SetInsertPoint(bodyBB);
-                pushScope();  // 循环体作用域
+                pushScope();
                 if (auto* bn = static_cast<Block*>(ws->body.get()))
                     for (auto& s : bn->statements) compileStmt(s.get());
                 popScope();

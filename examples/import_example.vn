@@ -17,6 +17,6 @@ while done == false {
     }
 }
 if done {
-    print("This will not run here")
+    print("You chose to stop the loop.")
 }
 print("Loop ended.")

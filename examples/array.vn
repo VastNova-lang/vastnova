@@ -1,0 +1,31 @@
+var a : i32[10]
+var b : i32[5] = [1, 2, 3, 4, 5]
+var c = [1, 2, 3]
+var d : f64[3] = [1.0, 2.0, 3.0]
+var names : str[3] = ["Alice", "Bob", "Carol"]
+var big = [5000000000, 1]
+
+a[0] = 10
+a[1] = 20
+
+var x = a[0]
+print("a[0] =", x, "a[1] =", a[1], "a[2] =", a[2])
+print("b:", b[0], b[1], b[2], b[3], b[4])
+print("c:", c[0], c[1], c[2])
+print("d:", d[0], d[1], d[2])
+print("names:", names[0], names[1], names[2])
+print("big:", big[0], big[1])
+
+var i = 0
+while i < 3 {
+    a[i] = i * i
+    i = i + 1
+}
+print("a after loop:", a[0], a[1], a[2], a[3])
+
+fn total() -> i32 {
+    var t : i32[3] = [3, 4, 5]
+    return t[0] + t[1] + t[2]
+}
+
+print("total =", total())
