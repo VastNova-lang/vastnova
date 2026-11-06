@@ -319,8 +319,8 @@ private:
                 v, llvm::ConstantFP::get(ty, 0.0), "fcond");
         if (ty->isPointerTy())
             return builder->CreateICmpNE(
-                v, llvm::ConstantPointerNull::get(
-                       llvm::cast<llvm::PointerType>(ty)), "pcond");
+                builder->CreateCall(module->getFunction("strlen"), {v}, "strlen"),
+                llvm::ConstantInt::get(llvm::Type::getInt64Ty(context), 0), "scond");
         error("condition must be a number or a string");
         return nullptr;
     }
