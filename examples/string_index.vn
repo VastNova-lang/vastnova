@@ -1,0 +1,28 @@
+// String indexing returns a new one-character string.
+var word : str = "VastNova"
+print(word[0])                  // V
+print(word[4])                  // N
+print(word[0] + word[1])        // Va
+print(word[0] == "V")           // 1
+
+// String literals and concatenation results can be indexed too.
+print("xyz"[2])                 // z
+print(("hello " + "world")[6])  // w
+
+// A function call that returns a string can be indexed as well.
+fn greeting() -> str {
+    return "hello"
+}
+print(greeting()[1])            // e
+
+// String elements of an array can be indexed as well.
+var names : str[2] = ["Alice", "Bob"]
+print(names[0][0])              // A
+print(names[1][0])              // B
+
+// Indices are not bounds-checked; this loop only reads valid positions.
+var i = 0
+while i < 4 {
+    print(word[i])
+    i = i + 1
+}

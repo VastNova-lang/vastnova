@@ -634,6 +634,39 @@ private:
         return result;
     }
 
+    // Indexing a string yields a newly allocated one-byte string. The index is
+    // a byte offset into the UTF-8 buffer and is not bounds-checked.
+    llvm::Value* compileStringIndex(llvm::Value* str, const ASTNode* indexNode) {
+        auto* index = compileExpr(indexNode);
+        if (!index) return nullptr;
+        if (!index->getType()->isIntegerTy()) {
+            error("string index must be an integer");
+            return nullptr;
+        }
+
+        auto* i8Ty = llvm::Type::getInt8Ty(context);
+        auto* charPtr = builder->CreateInBoundsGEP(i8Ty, str, index,
+                                                   "str_char_ptr");
+        auto* ch = builder->CreateLoad(i8Ty, charPtr, "str_char");
+
+        auto* mallocFn = module->getFunction("malloc");
+        auto* result = builder->CreateCall(mallocFn, {
+            llvm::ConstantInt::get(llvm::Type::getInt64Ty(context), 2)
+        }, "char_str");
+        auto* offset0 = llvm::ConstantInt::get(
+            llvm::Type::getInt32Ty(context), 0);
+        auto* offset1 = llvm::ConstantInt::get(
+            llvm::Type::getInt32Ty(context), 1);
+        auto* charSlot = builder->CreateInBoundsGEP(i8Ty, result, offset0,
+                                                    "char_slot");
+        builder->CreateStore(ch, charSlot);
+        auto* endSlot = builder->CreateInBoundsGEP(i8Ty, result, offset1,
+                                                   "char_end");
+        builder->CreateStore(
+            llvm::ConstantInt::get(llvm::Type::getInt8Ty(context), 0), endSlot);
+        return result;
+    }
+
     llvm::Value* callStrcmp(llvm::Value* left, llvm::Value* right) {
         auto strcmpFn = module->getOrInsertFunction("strcmp",
             llvm::FunctionType::get(llvm::Type::getInt32Ty(context),
@@ -689,6 +722,11 @@ private:
             llvm::Type* baseTy = nullptr;
             auto* basePtr = compileLValue(ix->base.get(), &baseTy);
             if (!basePtr) return nullptr;
+            if (baseTy->isPointerTy()) {
+                error("cannot assign to a character of a string; "
+                      "strings are immutable");
+                return nullptr;
+            }
             if (!baseTy->isArrayTy()) {
                 error("cannot index a non-array value");
                 return nullptr;
@@ -834,20 +872,30 @@ private:
             }
             case NodeType::IndexExpr: {
                 auto* ix = static_cast<const IndexExpr*>(node);
-                if (ix->base->type == NodeType::Variable ||
-                    ix->base->type == NodeType::IndexExpr) {
-                    llvm::Type* elemTy = nullptr;
-                    auto* ptr = compileLValue(node, &elemTy);
-                    if (!ptr) return nullptr;
-                    return builder->CreateLoad(elemTy, ptr, "elem");
+
+                // Array variables and array parameters are indexed directly.
+                if (ix->base->type == NodeType::Variable) {
+                    auto* var = static_cast<const Variable*>(ix->base.get());
+                    if (!lookupConst(var->name)) {
+                        auto* alloca = lookupVar(var->name);
+                        if (alloca && alloca->getAllocatedType()->isArrayTy()) {
+                            llvm::Type* elemTy = nullptr;
+                            auto* ptr = compileLValue(node, &elemTy);
+                            if (!ptr) return nullptr;
+                            return builder->CreateLoad(elemTy, ptr, "elem");
+                        }
+                    }
                 }
 
                 auto* base = compileExpr(ix->base.get());
                 if (!base) return nullptr;
+                if (base->getType()->isPointerTy())
+                    return compileStringIndex(base, ix->index.get());
                 if (!base->getType()->isArrayTy()) {
-                    error("cannot index a non-array value");
+                    error("cannot index a value that is neither an array nor a string");
                     return nullptr;
                 }
+
                 auto* index = compileExpr(ix->index.get());
                 if (!index) return nullptr;
                 if (!index->getType()->isIntegerTy()) {

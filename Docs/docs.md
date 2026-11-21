@@ -367,6 +367,20 @@ print("line one\nline two")
 print("tab\there")
 ```
 
+### String Indexing
+
+A string can be indexed with an integer to read one byte as a new one-character string. Index `0` is the first byte, so for ASCII text it is the character at that position.
+
+```vastnova
+var a : str = "abc"
+print(a[0])            // a
+print(a[1])            // b
+print(a[0] + a[2])     // ac
+print("xyz"[2])        // z
+```
+
+Indices are not bounds-checked. Because strings are UTF-8, non-ASCII characters occupy multiple bytes, so indexing works on bytes rather than whole characters. A string index is a value, not an assignable location: `a[0] = "x"` is an error; build a new string with concatenation instead.
+
 ### Concatenation (`+`)
 Two strings can be concatenated with `+`. The result is a newly allocated string.
 
@@ -514,6 +528,7 @@ print("max(-5, 2) =", max(-5, 2))
 - No dictionaries, structs, or other composite types.
 - No `else if` shortcut – nest `if` inside `else`.
 - String comparison only supports `==` and `!=`; `>`, `<`, `>=`, `<=` on strings are compile errors.
+- Strings can be indexed to read one byte as a one-character string; indices are not bounds-checked, and individual characters cannot be assigned.
 - `break` and `continue` can only appear inside loops.
 - Imported files are loaded at compile time; no dynamic imports.
 - All parameters must have explicit types; return type is written after `->`.
