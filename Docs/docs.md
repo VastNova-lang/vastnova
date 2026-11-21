@@ -105,13 +105,37 @@ print(a[1])      // an index expression can appear anywhere an expression can
 
 The index must be an integer. Indices are **not** bounds-checked; an out-of-range index reads or writes memory outside the array.
 
+### Arrays as Function Parameters
+
+A function parameter may use any fixed-length array type. Arrays are passed **by value**, so the function works on a copy.
+
+```vastnova
+fn sum(values : i32[5]) -> i32 {
+    var total = 0
+    var i = 0
+    while i < 5 {
+        total = total + values[i]
+        i = i + 1
+    }
+    return total
+}
+
+var scores : i32[5] = [10, 20, 30, 40, 50]
+print(sum(scores))            // 150
+print(sum([1, 2, 3, 4, 5]))   // 150
+```
+
+- The parameter type must include the array length (`i32[5]`, not `i32[]`).
+- An array variable passed as an argument must match the parameter type exactly; an array literal only needs the right number of elements and is converted to the parameter's element type.
+- Inside the function the parameter behaves like a local array: read or write elements with indexing, and pass it on to another array parameter. It cannot be printed, assigned as a whole, or returned.
+
 ### Restrictions
 
 - Arrays must have a positive, integer, literal length.
 - Nested arrays (`i32[2][3]`) are not supported.
-- Arrays cannot be used as parameter types, return types, or constants (`let`).
-- An array cannot be used as a whole value: `print(a)` and `a = [1, 2]` are errors. Read or write single elements instead.
-- An array literal can only appear as the initializer of a `var` declaration, and it cannot be empty.
+- Arrays cannot be used as return types or constants (`let`).
+- An array cannot be used as a general whole value: `print(a)` and `a = [1, 2]` are errors. Read or write single elements instead. The one exception is passing an array to a function parameter, which copies the whole array (see [Arrays as Function Parameters](#arrays-as-function-parameters)).
+- An array literal can appear as the initializer of a `var` declaration or as an argument to an array parameter (see [Arrays as Function Parameters](#arrays-as-function-parameters)), and it cannot be empty.
 
 ## 5. Arithmetic Expressions
 
@@ -255,6 +279,8 @@ greet("Alice")   // Hello, Alice
 greet("Bob")     // Hello, Bob
 ```
 
+Parameters may also have fixed-length array types; see [Arrays as Function Parameters](#arrays-as-function-parameters).
+
 ### With a return value
 
 ```vastnova
@@ -303,7 +329,7 @@ var y = greet("Alice")  // ERROR: cannot assign void
 ### Rules and restrictions
 
 - Parameter and return types must be explicit (return type may be omitted, meaning `void`).
-- Arrays cannot be parameter or return types.
+- Array parameters must have a fixed length (for example `i32[5]`). Arrays cannot be return types.
 - Function names must be unique; declaring `fn main` or duplicating a function name is an error.
 - Functions may call each other before their definitions appear, so recursion works.
 
@@ -474,7 +500,7 @@ print("max(-5, 2) =", max(-5, 2))
 ## 15. Errors and Limitations
 
 - Arrays are fixed-length and one-dimensional; no resizing, no nested arrays, no bounds checking.
-- Arrays cannot be function parameters, return values, or constants, and cannot be printed or assigned as a whole.
+- Arrays can be function parameters, but only by value with a fixed-length parameter type. Arrays cannot be return values or constants, and cannot be printed or assigned as a whole.
 - No dictionaries, structs, or other composite types.
 - No `else if` shortcut – nest `if` inside `else`.
 - String comparison only supports `==` and `!=`; `>`, `<`, `>=`, `<=` on strings are compile errors.

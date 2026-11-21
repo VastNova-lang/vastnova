@@ -461,8 +461,6 @@ std::unique_ptr<ASTNode> Parser::parseStatement() {
                 if (!matchSymbol(":"))
                     throw std::runtime_error("Expected ':' after parameter name");
                 p.type = parseTypeName();
-                if (isArrayTypeName(p.type))
-                    throw std::runtime_error("Array types are not supported as parameter types");
                 fn->params.push_back(p);
                 if (matchSymbol(",")) continue;
                 if (matchSymbol(")")) break;

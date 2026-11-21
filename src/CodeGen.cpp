@@ -745,6 +745,47 @@ private:
         return agg;
     }
 
+    // Array parameters are passed by value: an array variable is loaded as a
+    // whole aggregate, and an array literal is materialized at the parameter type.
+    llvm::Value* compileArrayArgument(const ASTNode* node, llvm::Type* paramTy,
+                                      const std::string& fnName, size_t argIndex) {
+        auto* arrTy = llvm::cast<llvm::ArrayType>(paramTy);
+        std::string where = "argument " + std::to_string(argIndex + 1) +
+                            " of function '" + fnName + "'";
+
+        if (node->type == NodeType::ArrayLiteral) {
+            auto* lit = static_cast<const ArrayLiteral*>(node);
+            if (lit->elements.size() != arrTy->getNumElements()) {
+                error(where + " expects " +
+                      std::to_string(arrTy->getNumElements()) +
+                      " element(s), but the array literal has " +
+                      std::to_string(lit->elements.size()));
+                return nullptr;
+            }
+            bool failed = false;
+            auto* value = buildArrayInitializer(lit, arrTy, where, failed);
+            return failed ? nullptr : value;
+        }
+
+        if (node->type == NodeType::Variable) {
+            auto* var = static_cast<const Variable*>(node);
+            auto* alloca = lookupVar(var->name);
+            if (!alloca) {
+                error("unknown variable '" + var->name + "'");
+                return nullptr;
+            }
+            if (alloca->getAllocatedType() != paramTy) {
+                error(where + " requires an array of the exact parameter type; '" +
+                      var->name + "' does not match");
+                return nullptr;
+            }
+            return builder->CreateLoad(arrTy, alloca, var->name);
+        }
+
+        error(where + " must be an array variable or an array literal");
+        return nullptr;
+    }
+
     llvm::Value* compileExpr(const ASTNode* node) {
         switch (node->type) {
             case NodeType::Number: {
@@ -775,7 +816,8 @@ private:
                     auto* ty = alloca->getAllocatedType();
                     if (ty->isArrayTy()) {
                         error("array '" + var->name +
-                              "' cannot be used as a value; index it instead");
+                              "' cannot be used as a value here; index it or "
+                              "pass it to an array parameter");
                         return nullptr;
                     }
                     return builder->CreateLoad(ty, alloca, var->name);
@@ -790,7 +832,8 @@ private:
                 return builder->CreateLoad(elemTy, ptr, "elem");
             }
             case NodeType::ArrayLiteral: {
-                error("an array literal can only be used to initialize a variable");
+                error("an array literal can only be used to initialize a variable "
+                      "or as an array argument");
                 return nullptr;
             }
             case NodeType::UnaryOp: {
@@ -962,10 +1005,16 @@ private:
                 }
                 std::vector<llvm::Value*> args;
                 for (size_t i = 0; i < call->args.size(); ++i) {
-                    auto v = compileExpr(call->args[i].get());
-                    if (!v) return nullptr;
                     auto* pty = fn->getFunctionType()->getParamType(i);
-                    if (v->getType() != pty) v = convertValue(v, pty);
+                    llvm::Value* v = nullptr;
+                    if (pty->isArrayTy()) {
+                        v = compileArrayArgument(call->args[i].get(), pty,
+                                                 call->name, i);
+                    } else {
+                        v = compileExpr(call->args[i].get());
+                        if (v && v->getType() != pty) v = convertValue(v, pty);
+                    }
+                    if (!v) return nullptr;
                     args.push_back(v);
                 }
                 if (fn->getReturnType()->isVoidTy()) {

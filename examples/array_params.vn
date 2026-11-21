@@ -1,0 +1,41 @@
+// Demonstrates arrays as function parameters.
+// Array parameters are passed by value: the function receives a copy.
+
+fn sum(values : i32[5]) -> i32 {
+    var total = 0
+    var i = 0
+    while i < 5 {
+        total = total + values[i]
+        i = i + 1
+    }
+    return total
+}
+
+fn average(values : f64[3]) -> f64 {
+    return (values[0] + values[1] + values[2]) / 3.0
+}
+
+fn reset(values : f64[3]) {
+    values[0] = 0.0
+    values[1] = 0.0
+    values[2] = 0.0
+}
+
+fn describe(values : i32[5]) -> str {
+    return "sum = " + str(sum(values))
+}
+
+var scores : i32[5] = [10, 20, 30, 40, 50]
+print("scores:", scores[0], scores[1], scores[2], scores[3], scores[4])
+print("sum(scores) =", sum(scores))
+print("sum([1, 2, 3, 4, 5]) =", sum([1, 2, 3, 4, 5]))
+
+var prices = [1.5, 2.5, 3.5]
+print("average(prices) =", average(prices))
+
+// The function only changes its local copy, so prices stay the same.
+reset(prices)
+print("prices after reset():", prices[0], prices[1], prices[2])
+
+// An array parameter can be passed on to another array parameter.
+print(describe(scores))
