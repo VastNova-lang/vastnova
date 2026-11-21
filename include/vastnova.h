@@ -39,9 +39,6 @@ static inline bool isTypeKeyword(const std::string& s) {
     return s == "i32" || s == "i64" || s == "f32" || s == "f64" ||
            s == "str" || s == "void";
 }
-static inline bool isArrayTypeName(const std::string& s) {
-    return s.find('[') != std::string::npos;
-}
 
 class Tokenizer {
     std::string src;
@@ -277,6 +274,8 @@ std::string Parser::parseTypeName() {
     std::string typeName = current().value;
     advance();
     if (matchSymbol("[")) {
+        if (typeName == "void")
+            throw std::runtime_error("Array element type cannot be void");
         if (current().type != Token::Number) {
             throw std::runtime_error("Expected array length");
         }
@@ -471,8 +470,6 @@ std::unique_ptr<ASTNode> Parser::parseStatement() {
         fn->returnType = "void";
         if (matchSymbol("->")) {
             fn->returnType = parseTypeName();
-            if (isArrayTypeName(fn->returnType))
-                throw std::runtime_error("Array types are not supported as return types");
         }
 
         fn->body = parseBlock();

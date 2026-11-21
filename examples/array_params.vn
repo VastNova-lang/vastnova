@@ -1,5 +1,5 @@
-// Demonstrates arrays as function parameters.
-// Array parameters are passed by value: the function receives a copy.
+// Demonstrates arrays as function parameters and return values.
+// Arrays are passed and returned by value: the function works on a copy.
 
 fn sum(values : i32[5]) -> i32 {
     var total = 0
@@ -9,6 +9,14 @@ fn sum(values : i32[5]) -> i32 {
         i = i + 1
     }
     return total
+}
+
+fn make_sequence() -> i32[5] {
+    return [5, 10, 15, 20, 25]
+}
+
+fn identity(values : i32[5]) -> i32[5] {
+    return values
 }
 
 fn average(values : f64[3]) -> f64 {
@@ -29,6 +37,18 @@ var scores : i32[5] = [10, 20, 30, 40, 50]
 print("scores:", scores[0], scores[1], scores[2], scores[3], scores[4])
 print("sum(scores) =", sum(scores))
 print("sum([1, 2, 3, 4, 5]) =", sum([1, 2, 3, 4, 5]))
+
+// Functions can also return arrays by value.
+var sequence = make_sequence()
+print("returned:", sequence[0], sequence[1], sequence[2], sequence[3], sequence[4])
+print("direct index:", make_sequence()[2])
+print("sum(returned) =", sum(make_sequence()))
+
+var explicit_sequence : i32[5] = make_sequence()
+print("explicit return:", explicit_sequence[4])
+
+var copied = identity(scores)
+print("returned parameter:", copied[4])
 
 var prices = [1.5, 2.5, 3.5]
 print("average(prices) =", average(prices))

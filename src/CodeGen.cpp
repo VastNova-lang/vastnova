@@ -279,6 +279,8 @@ private:
         } else if (ty->isPointerTy()) {
             auto* empty = builder->CreateGlobalString("", "empty_ret_str");
             builder->CreateRet(builder->CreatePointerCast(empty, ty));
+        } else if (ty->isArrayTy()) {
+            builder->CreateRet(llvm::ConstantAggregateZero::get(ty));
         } else {
             builder->CreateRetVoid();
         }
@@ -745,13 +747,12 @@ private:
         return agg;
     }
 
-    // Array parameters are passed by value: an array variable is loaded as a
-    // whole aggregate, and an array literal is materialized at the parameter type.
-    llvm::Value* compileArrayArgument(const ASTNode* node, llvm::Type* paramTy,
-                                      const std::string& fnName, size_t argIndex) {
-        auto* arrTy = llvm::cast<llvm::ArrayType>(paramTy);
-        std::string where = "argument " + std::to_string(argIndex + 1) +
-                            " of function '" + fnName + "'";
+    // Array values are handled by value: an array variable is loaded as a whole
+    // aggregate, an array literal is materialized at the expected type, and any
+    // other expression (such as a call) must produce exactly the expected type.
+    llvm::Value* compileArrayValue(const ASTNode* node, llvm::Type* expectedTy,
+                                   const std::string& where) {
+        auto* arrTy = llvm::cast<llvm::ArrayType>(expectedTy);
 
         if (node->type == NodeType::ArrayLiteral) {
             auto* lit = static_cast<const ArrayLiteral*>(node);
@@ -774,16 +775,22 @@ private:
                 error("unknown variable '" + var->name + "'");
                 return nullptr;
             }
-            if (alloca->getAllocatedType() != paramTy) {
-                error(where + " requires an array of the exact parameter type; '" +
+            if (alloca->getAllocatedType() != expectedTy) {
+                error(where + " requires an array of the exact expected type; '" +
                       var->name + "' does not match");
                 return nullptr;
             }
             return builder->CreateLoad(arrTy, alloca, var->name);
         }
 
-        error(where + " must be an array variable or an array literal");
-        return nullptr;
+        auto* value = compileExpr(node);
+        if (!value) return nullptr;
+        if (value->getType() != expectedTy) {
+            error(where + " requires an array of the exact expected type; "
+                  "the value does not match");
+            return nullptr;
+        }
+        return value;
     }
 
     llvm::Value* compileExpr(const ASTNode* node) {
@@ -816,8 +823,8 @@ private:
                     auto* ty = alloca->getAllocatedType();
                     if (ty->isArrayTy()) {
                         error("array '" + var->name +
-                              "' cannot be used as a value here; index it or "
-                              "pass it to an array parameter");
+                              "' cannot be used as a value here; index it, "
+                              "return it, or pass it to an array parameter");
                         return nullptr;
                     }
                     return builder->CreateLoad(ty, alloca, var->name);
@@ -826,14 +833,42 @@ private:
                 return nullptr;
             }
             case NodeType::IndexExpr: {
-                llvm::Type* elemTy = nullptr;
-                auto* ptr = compileLValue(node, &elemTy);
-                if (!ptr) return nullptr;
-                return builder->CreateLoad(elemTy, ptr, "elem");
+                auto* ix = static_cast<const IndexExpr*>(node);
+                if (ix->base->type == NodeType::Variable ||
+                    ix->base->type == NodeType::IndexExpr) {
+                    llvm::Type* elemTy = nullptr;
+                    auto* ptr = compileLValue(node, &elemTy);
+                    if (!ptr) return nullptr;
+                    return builder->CreateLoad(elemTy, ptr, "elem");
+                }
+
+                auto* base = compileExpr(ix->base.get());
+                if (!base) return nullptr;
+                if (!base->getType()->isArrayTy()) {
+                    error("cannot index a non-array value");
+                    return nullptr;
+                }
+                auto* index = compileExpr(ix->index.get());
+                if (!index) return nullptr;
+                if (!index->getType()->isIntegerTy()) {
+                    error("array index must be an integer");
+                    return nullptr;
+                }
+
+                auto* arrTy = llvm::cast<llvm::ArrayType>(base->getType());
+                auto* tmp = builder->CreateAlloca(arrTy, nullptr, "array_value");
+                builder->CreateStore(base, tmp);
+                auto* ptr = builder->CreateInBoundsGEP(
+                    arrTy, tmp,
+                    {llvm::ConstantInt::get(llvm::Type::getInt32Ty(context), 0),
+                     index},
+                    "elem_ptr");
+                return builder->CreateLoad(
+                    arrTy->getArrayElementType(), ptr, "elem");
             }
             case NodeType::ArrayLiteral: {
-                error("an array literal can only be used to initialize a variable "
-                      "or as an array argument");
+                error("an array literal can only be used to initialize an array, "
+                      "pass an array argument, or return an array value");
                 return nullptr;
             }
             case NodeType::UnaryOp: {
@@ -897,6 +932,12 @@ private:
                 auto left = compileExpr(bin->left.get());
                 auto right = compileExpr(bin->right.get());
                 if (!left || !right) return nullptr;
+
+                if (left->getType()->isArrayTy() ||
+                    right->getType()->isArrayTy()) {
+                    error("arrays cannot be used with operator '" + op + "'");
+                    return nullptr;
+                }
 
                 bool leftIsPtr  = left->getType()->isPointerTy();
                 bool rightIsPtr = right->getType()->isPointerTy();
@@ -1006,12 +1047,18 @@ private:
                 std::vector<llvm::Value*> args;
                 for (size_t i = 0; i < call->args.size(); ++i) {
                     auto* pty = fn->getFunctionType()->getParamType(i);
+                    std::string where = "argument " + std::to_string(i + 1) +
+                                        " of function '" + call->name + "'";
                     llvm::Value* v = nullptr;
                     if (pty->isArrayTy()) {
-                        v = compileArrayArgument(call->args[i].get(), pty,
-                                                 call->name, i);
+                        v = compileArrayValue(call->args[i].get(), pty, where);
                     } else {
                         v = compileExpr(call->args[i].get());
+                        if (v && v->getType()->isArrayTy()) {
+                            error(where + " is an array, but the parameter is "
+                                  "not an array");
+                            return nullptr;
+                        }
                         if (v && v->getType() != pty) v = convertValue(v, pty);
                     }
                     if (!v) return nullptr;
@@ -1050,11 +1097,24 @@ private:
                         error("'return' without a value inside a non-void function");
                         addDefaultReturn(currentReturnType);
                     } else {
-                        auto v = compileExpr(rs->value.get());
+                        llvm::Value* v = nullptr;
+                        if (retTy->isArrayTy()) {
+                            std::string where = "return value of function '" +
+                                                mainFunc->getName().str() + "'";
+                            v = compileArrayValue(rs->value.get(), retTy, where);
+                        } else {
+                            v = compileExpr(rs->value.get());
+                            if (v && v->getType()->isArrayTy()) {
+                                error("cannot return an array from a function "
+                                      "returning '" + currentReturnType + "'");
+                                v = nullptr;
+                            } else if (v) {
+                                v = convertValue(v, retTy);
+                            }
+                        }
                         if (!v) {
                             addDefaultReturn(currentReturnType);
                         } else {
-                            v = convertValue(v, retTy);
                             builder->CreateRet(v);
                         }
                     }
@@ -1121,9 +1181,17 @@ private:
                     }
                 } else if (vd->init) {
                     if (ty && ty->isArrayTy()) {
-                        error("array '" + vd->name +
-                              "' must be initialized with an array literal");
-                        initFailed = true;
+                        if (vd->init->type != NodeType::Call) {
+                            error("array '" + vd->name +
+                                  "' must be initialized with an array literal "
+                                  "or a function call returning an array");
+                            initFailed = true;
+                        } else {
+                            initVal = compileArrayValue(
+                                vd->init.get(), ty,
+                                "initializer of array '" + vd->name + "'");
+                            if (!initVal) initFailed = true;
+                        }
                     } else {
                         initVal = compileExpr(vd->init.get());
                         if (!initVal) {
@@ -1131,6 +1199,12 @@ private:
                         } else if (initVal->getType()->isVoidTy()) {
                             error("variable '" + vd->name +
                                   "' cannot be initialized with a void value");
+                            initVal = nullptr;
+                            initFailed = true;
+                        } else if (initVal->getType()->isArrayTy() && ty) {
+                            error("variable '" + vd->name + "' of type '" +
+                                  vd->type +
+                                  "' cannot be initialized with an array value");
                             initVal = nullptr;
                             initFailed = true;
                         } else if (vd->type.empty()) {
@@ -1251,6 +1325,9 @@ private:
                         format = "%f";
                     } else if (val->getType()->isPointerTy()) {
                         format = "%s";
+                    } else if (val->getType()->isArrayTy()) {
+                        error("print() cannot print an array");
+                        continue;
                     } else {
                         format = "%p";
                     }
