@@ -20,19 +20,38 @@ VastNova supports three forms of comments:
 
 ## 2. Types
 
-VastNova has five primitive types and fixed-length arrays:
+VastNova has arbitrary-width integers, four floating-point types, `str`, and fixed-length arrays.
 
-| Type  | Description                    | Example literals |
-|-------|--------------------------------|------------------|
-| `i32` | 32-bit signed integer (default) | `42`, `-5`       |
-| `i64` | 64-bit signed integer          | `5000000000`     |
-| `f32` | 32-bit IEEE-754 float          | `3.14`           |
-| `f64` | 64-bit IEEE-754 float (default float) | `3.14`, `-0.001` |
-| `str` | UTF-8 string (heap-allocated)  | `"Hello"`        |
+Integer types are written `iN` (signed) or `uN` (unsigned), where `N` is a positive bit width.
+Any width from 1 to 65535 is accepted; there is no fixed list of integer types.
+
+| Type  | Description                         | Range / example values |
+|-------|-------------------------------------|------------------|
+| `iN`  | signed two's-complement integer     | `i3` is -4..3; `i32` is -2147483648..2147483647 |
+| `uN`  | unsigned integer                    | `u3` is 0..7; `u8` is 0..255 |
+| `f16` | 16-bit IEEE-754 float               | `1.5`, `-0.25` |
+| `f32` | 32-bit IEEE-754 float               | `1.5`, `-0.25` |
+| `f64` | 64-bit IEEE-754 float (default)     | `3.14`, `-0.001` |
+| `f128`| 128-bit IEEE-754 float              | `2.5`, `-1.0e10` |
+| `str` | UTF-8 string (heap-allocated)       | `"Hello"` |
+
+Only `f16`, `f32`, `f64`, and `f128` are valid float types. `f9`, `f18`, and every other
+float width are compile errors.
 
 All types are **static** but can be **inferred** when a value is given.
 
-Integer literals that fit in 32 bits are `i32`; larger literals are `i64`. Literals containing a `.` are `f64`.
+A bare integer literal that fits in `i32` is `i32`; larger literals are `i64`, and
+literals above `i64` range are `u64`. An integer literal that does not fit in `u64`
+is a compile error. Literals containing a `.` are `f64`.
+
+```vastnova
+var a : i3 = 2
+var b : i18 = 100000
+var c : u8 = 200
+var d : u3 = 7
+var e : i128 = int(18446744073709551615, 128)
+var f : f32 = float(1.5, 32)
+```
 
 ## 3. Variables and Constants
 
@@ -86,14 +105,23 @@ var d : f64[3] = [1.0, 2.0, 3.0]
 var names : str[3] = ["a", "b", "c"]
 ```
 
-When the type is omitted, it is inferred from the literal:
+When the type is omitted, it is inferred from the literal using the same rules as
+mixed arithmetic:
 
-- all integer elements that fit in 32 bits → `i32[n]`
-- any element outside 32-bit range → `i64[n]`
-- any floating-point element → `f64[n]`
+- all integer elements with the same signedness → that signedness at the widest element width
+- signed and unsigned integer elements mixed → compile error
+- any floating-point element with an integer element → `f64`
+- all floating-point elements → the widest float width
 - all string elements → `str[n]`
-- numeric elements are widened to a common type (`i32` + `i64` → `i64`, integer + float → `f64`)
 - mixing strings and numbers in one literal is an error
+
+```vastnova
+var a = [1, 2, 3]                  // i32[3]
+var b = [1, 2, 3, 4000000000]      // i64[4]
+var c : u8[3] = [200, 100, 50]     // explicit unsigned element type
+var d : i3[3] = [1, 2, 3]          // explicit 3-bit elements
+var e = [1.0, 2.5]                 // f64[2]
+```
 
 ### Indexing
 
@@ -165,10 +193,34 @@ var h = -a * 2        // (-10) * 2 = -20
 ```
 
 All arithmetic is **type-aware**:
-- If both operands are integers, the result is an integer (truncating division). If either operand is `i64`, the result is `i64`; otherwise `i32`.
-- If either operand is a float, the result is `f64`.
+
+- Two integers must have the same signedness. The result keeps that signedness and uses
+  the wider of the two widths (`i3 + i18` → `i18`; `u8 + u8` → `u8`).
+- Mixing signed and unsigned integers is a compile error. An untyped integer literal or
+  constant adapts to the other operand's type when its value fits, so `u8 + 1` stays
+  `u8`, while `u8 + 300` is an error (300 does not fit) and `i3 + 100` becomes `i32`.
+- Integer arithmetic **wraps modulo 2^N**. Signed values use two's complement:
+  `3 + 1` in `i3` is `-4`, and `7 + 1` in `u3` is `0`. There are no overflow traps.
+- Integer division truncates toward zero for signed types and rounds down for unsigned
+  types. Division by zero is not checked.
+- An integer combined with a float produces `f64`. Two floats produce the wider float
+  type (`f16 + f32` → `f32`, `f32 + f64` → `f64`, `f64 + f128` → `f128`).
 - String `+` performs **concatenation** (only between strings).
-- Mixing numbers and strings in an operator is a compile error; use `str()` to convert numbers explicitly.
+- Mixing numbers and strings in an operator is a compile error; use `str()` to convert
+  numbers explicitly.
+
+```vastnova
+var a : i3 = 3
+print(a + 1)              // -4
+var b : u3 = 7
+print(b + 1)              // 0
+var c : i18 = 100000
+print(c + a)              // 100002
+print(int(1, 32) + 0.5)   // 1.500000 (f64)
+```
+
+Narrowing a non-constant integer or changing its signedness requires an explicit
+`int()` or `uint()` conversion (see [Conversion from strings](#conversion-from-strings-int-uint-float)).
 
 ## 6. Output: `print`
 
@@ -194,7 +246,7 @@ print("Hello,", name, "age:", age)
 
 The whole line is read, including spaces, up to the newline (or end of input). The buffer grows as needed, so line length is not limited. The prompt is printed as a plain string, so it may contain `%` safely.
 
-`input` always returns a string. To perform numeric operations, convert the result using `int()` or `float()`.
+`input` always returns a string. To perform numeric operations, convert the result using `int()`, `uint()`, or `float()`.
 
 ## 8. Conditionals: `if` / `else`
 
@@ -394,27 +446,80 @@ var full = first + " " + last   // "Hello World"
 Strings can be compared with `==` and `!=` only; ordering comparisons (`>`, `<`, `>=`, `<=`) are compile errors. Comparing a string with a number is also an error.
 
 ### Conversion from numbers (`str()`)
-The built-in function `str(value)` converts an integer or float to its string representation, and returns a string unchanged.
+The built-in function `str(value)` converts an integer or float to its string representation, and returns a string unchanged. It works for every integer width, including widths above 64 bits.
 
 ```vastnova
 var pi = 3.14159
 var pi_str = str(pi)          // "3.14159"
 var msg = "Pi is " + pi_str
 print(msg)                   // Pi is 3.14159
+
+var big : i128 = int(18446744073709551615, 128)
+print(str(big))               // 18446744073709551615
 ```
 
-### Conversion from strings (`int()`, `float()`)
-These built-in functions convert a string (or number) to an integer or float. They are essential for processing user input numerically.
+### Conversion from strings (`int()`, `uint()`, `float()`)
+These built-in functions convert a number or string to an integer or float. They are essential for processing user input numerically.
+
+| Call | Result |
+|------|--------|
+| `int(x)` | signed integer, default width `i32` |
+| `int(x, N)` | signed integer of width `N` |
+| `uint(x)` | unsigned integer, default width `u32` |
+| `uint(x, N)` | unsigned integer of width `N` |
+| `float(x)` | float, default `f64` |
+| `float(x, N)` | float of width `N` (`16`, `32`, `64`, or `128`) |
 
 ```vastnova
 var age_str = input("Enter your age: ")
-var age = int(age_str)        // convert to i32
-var weight_str = input("Enter your weight: ")
-var weight = float(weight_str) // convert to f64
-print("Next year you will be", age + 1)
+var age = int(age_str)          // i32
+var small = int(300, 8)         // 44 (300 modulo 256)
+var byte = uint(-1, 8)          // 255
+var narrow = int(7, 3)          // -1
+var weight = float("70.5")      // f64
+var single = float(1.5, 32)     // f32
+var quad = float(2.25, 128)     // f128
 ```
 
-If the argument is already a number, `int()` and `float()` simply cast it to the desired type. Arrays cannot be converted.
+- Integer conversions truncate/wrap to the target width; signed and unsigned
+  reinterpretation uses the target type's bit pattern.
+- Float-to-integer conversion truncates toward zero.
+- Integer-to-float conversion rounds to the nearest representable value.
+- A string argument is parsed as a decimal number (`int`/`uint`) or a floating-point
+  number (`float`). Integer parsing works at the requested width, including widths
+  above 64 bits.
+- Arrays cannot be converted.
+
+### Implicit conversions
+
+The compiler inserts these conversions automatically:
+
+- an integer constant whose value fits the target integer type
+- widening between integers of the same signedness (`i3` → `i18`, `u8` → `u64`)
+- widening between floats (`f16` → `f32` → `f64` → `f128`)
+- integer to float
+- float to a wider float, and float narrowing (for example `f64` to `f32`), which may lose precision
+
+Apart from constants whose value fits, everything else requires an explicit conversion:
+integer narrowing, any signed/unsigned change, and float-to-integer. This applies to
+variable initialization, assignment, function arguments, and `return` values.
+
+```vastnova
+var a : i3 = 2
+var b : i18 = a          // OK: widening
+var c : i64 = 42         // OK: constant fits
+var d : i3 = int(100, 3) // OK: explicit, wraps
+
+let k : u8 = 5
+var m : i32 = k          // OK: let constant fits
+
+var e : u8 = 5
+var f : i32 = e          // ERROR: signedness change
+var g : i32 = 5
+var h : u8 = g           // ERROR: signedness change
+var i : i8 = 1000        // ERROR: constant does not fit
+var j : i32 = 3.5        // ERROR: use int(3.5)
+```
 
 ## 12. Variable Reassignment
 
@@ -422,10 +527,14 @@ Variables declared with `var` can be reassigned at any time. The new value must 
 
 ```vastnova
 var x = 10
-x = 20          // OK
-x = 3.5         // OK: truncated to 3 when stored in i32
-x = "text"      // ERROR: cannot convert a string to a number
+x = 20              // OK
+x = int(3.5)        // OK: truncates to 3
+x = uint(-1, 8)     // ERROR: u8 is not i32
+x = "text"          // ERROR: cannot convert a string to a number
 ```
+
+Assignment uses the same implicit conversion rules as initialization (see
+[Implicit conversions](#implicit-conversions)).
 
 Constants (`let`) cannot be reassigned. A whole array cannot be reassigned; assign individual elements instead.
 
@@ -523,6 +632,9 @@ print("max(-5, 2) =", max(-5, 2))
 
 ## 15. Errors and Limitations
 
+- Integer widths are limited to 65535 bits. Arithmetic wraps modulo 2^N; overflow is not detected.
+- There are no bitwise or shift operators, so very wide integers cannot be manipulated bit by bit.
+- Only `f16`, `f32`, `f64`, and `f128` are available; other float widths such as `f9` or `f80` are compile errors.
 - Arrays are fixed-length and one-dimensional; no resizing, no nested arrays, no bounds checking.
 - Arrays can be function parameters and return values, but only by value with fixed-length types. They cannot be constants, printed, or assigned as a whole.
 - No dictionaries, structs, or other composite types.

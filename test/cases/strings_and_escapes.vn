@@ -1,0 +1,16 @@
+var text = "hello"
+print(text[1])
+print("a" + "b")
+
+print(text == "hello", text != "world")
+print("tab\there")
+print("line\nnext")
+print("quote\"slash\\")
+print("unknown\q")
+print(str(123), str(-4.5))
+
+var big : i128 = int("170141183460469231731687303715884105727", 128)
+print(str(big))
+
+print("xyz"[2])
+print(str("abc"))

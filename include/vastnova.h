@@ -2,6 +2,7 @@
 #define VASTNOVA_H
 
 #include "vastnova_ast.h"
+#include "vastnova_types.h"
 #include <iostream>
 #include <string>
 #include <vector>
@@ -28,7 +29,7 @@ static inline bool isExpressionStart(const Token& t) {
         return true;
     if (t.type == Token::Keyword) {
         if (t.value == "input" || t.value == "str" ||
-            t.value == "int"   || t.value == "float")
+            t.value == "int"   || t.value == "uint" || t.value == "float")
             return true;
     }
     if (t.type == Token::Symbol && (t.value == "(" || t.value == "-" || t.value == "["))
@@ -36,8 +37,7 @@ static inline bool isExpressionStart(const Token& t) {
     return false;
 }
 static inline bool isTypeKeyword(const std::string& s) {
-    return s == "i32" || s == "i64" || s == "f32" || s == "f64" ||
-           s == "str" || s == "void";
+    return isNumericTypeWord(s) || s == "str" || s == "void";
 }
 
 class Tokenizer {
@@ -92,9 +92,10 @@ public:
                     ident == "while" || ident == "break" || ident == "continue" ||
                     ident == "import" || ident == "fn" || ident == "return" ||
                     ident == "print" ||
-                    ident == "i32" || ident == "i64" || ident == "f32" || ident == "f64" ||
+                    isNumericTypeWord(ident) ||
                     ident == "str" || ident == "void" ||
-                    ident == "input" || ident == "int" || ident == "float") {
+                    ident == "input" || ident == "int" || ident == "uint" ||
+                    ident == "float") {
                     tokens.emplace_back(Token::Keyword, ident);
                 } else {
                     tokens.emplace_back(Token::Ident, ident);
@@ -218,6 +219,7 @@ class Parser {
     std::unique_ptr<ASTNode> parsePostfix();
     std::unique_ptr<ASTNode> parseIndexChain(std::unique_ptr<ASTNode> base);
     std::unique_ptr<ASTNode> parseArrayLiteral();
+    std::unique_ptr<ASTNode> parseConversionCall(const std::string& name);
     std::string parseTypeName();
     std::unique_ptr<ASTNode> parseBinaryOp(int minPrec);
     std::unique_ptr<ASTNode> parseCondition();
@@ -292,7 +294,55 @@ std::string Parser::parseTypeName() {
             throw std::runtime_error("Nested arrays are not supported");
         typeName += "[" + len + "]";
     }
-    return typeName;
+    TypeInfo info;
+    std::string error;
+    if (!parseTypeInfo(typeName, info, error)) throw std::runtime_error(error);
+    return info.name();
+}
+
+std::unique_ptr<ASTNode> Parser::parseConversionCall(const std::string& name) {
+    advance();
+    if (!matchSymbol("(")) throw std::runtime_error("Expected '(' after " + name);
+    auto call = std::make_unique<Call>(name);
+    if (matchSymbol(")")) {
+        throw std::runtime_error(name + " requires at least one argument");
+    }
+    call->args.push_back(parseExpression());
+    if (matchSymbol(",")) {
+        if (name == "str")
+            throw std::runtime_error("str() takes exactly one argument");
+        if (current().type != Token::Number)
+            throw std::runtime_error("The width passed to " + name +
+                                     "() must be an integer literal");
+        std::string widthText = current().value;
+        unsigned long long width = 0;
+        for (char c : widthText) {
+            if (!std::isdigit(static_cast<unsigned char>(c)))
+                throw std::runtime_error("The width passed to " + name +
+                                         "() must be an integer literal");
+            width = width * 10 + static_cast<unsigned>(c - '0');
+            if (width > 1000000ull) width = 1000001ull;
+        }
+        if (name == "float") {
+            if (width != 16 && width != 32 && width != 64 && width != 128)
+                throw std::runtime_error(
+                    "float() width must be 16, 32, 64, or 128");
+        } else {
+            if (width == 0)
+                throw std::runtime_error(
+                    "The integer width passed to " + name +
+                    "() must be a positive integer");
+            if (width > kMaxIntegerBits)
+                throw std::runtime_error(
+                    "The integer width passed to " + name +
+                    "() must be at most " + std::to_string(kMaxIntegerBits));
+        }
+        call->args.push_back(std::make_unique<Number>(widthText));
+        advance();
+    }
+    if (!matchSymbol(")"))
+        throw std::runtime_error("Expected ')' after " + name + " arguments");
+    return call;
 }
 
 std::unique_ptr<ASTNode> Parser::parsePrimary() {
@@ -346,38 +396,10 @@ std::unique_ptr<ASTNode> Parser::parsePrimary() {
         }
         return call;
     }
-    if (tok.type == Token::Keyword && tok.value == "str") {
-        advance();
-        if (!matchSymbol("(")) throw std::runtime_error("Expected '(' after str");
-        auto call = std::make_unique<Call>("str");
-        if (matchSymbol(")")) {
-            throw std::runtime_error("str requires one argument");
-        }
-        call->args.push_back(parseExpression());
-        if (!matchSymbol(")")) throw std::runtime_error("Expected ')' after str argument");
-        return call;
-    }
-    if (tok.type == Token::Keyword && tok.value == "int") {
-        advance();
-        if (!matchSymbol("(")) throw std::runtime_error("Expected '(' after int");
-        auto call = std::make_unique<Call>("int");
-        if (matchSymbol(")")) {
-            throw std::runtime_error("int requires one argument");
-        }
-        call->args.push_back(parseExpression());
-        if (!matchSymbol(")")) throw std::runtime_error("Expected ')' after int argument");
-        return call;
-    }
-    if (tok.type == Token::Keyword && tok.value == "float") {
-        advance();
-        if (!matchSymbol("(")) throw std::runtime_error("Expected '(' after float");
-        auto call = std::make_unique<Call>("float");
-        if (matchSymbol(")")) {
-            throw std::runtime_error("float requires one argument");
-        }
-        call->args.push_back(parseExpression());
-        if (!matchSymbol(")")) throw std::runtime_error("Expected ')' after float argument");
-        return call;
+    if (tok.type == Token::Keyword &&
+        (tok.value == "str" || tok.value == "int" ||
+         tok.value == "uint" || tok.value == "float")) {
+        return parseConversionCall(tok.value);
     }
     throw std::runtime_error("Unexpected token in expression: " + tok.value);
 }

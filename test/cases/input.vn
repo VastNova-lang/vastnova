@@ -1,0 +1,5 @@
+var name = input("Name: ")
+var age = int(input("Age: "))
+var line = input()
+print("Hello,", name, "next year:", age + 1)
+print("[", line, "]")

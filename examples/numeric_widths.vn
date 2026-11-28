@@ -1,0 +1,26 @@
+// Demonstrates arbitrary-width integers and overflow behavior.
+var a : i3 = 3
+var b : i3 = 1
+print(a + b)              // -4: i3 wraps modulo 8
+
+var c : u3 = 7
+print(c + 1)              // 0: u3 wraps modulo 8
+
+var d : u8 = 200
+print(d + 100)            // 44: u8 wraps modulo 256
+
+var e : i18 = 100000
+print(e + 1)              // 100001
+
+var f : i3 = 2
+print(e + f)              // 100002: the wider signed type wins
+
+var g : i128 = int(18446744073709551615, 128)
+print(g + int(1, 128))    // 18446744073709551616
+print(str(g))             // 18446744073709551615
+
+// Narrowing and signedness changes are explicit.
+var h : i8 = int(200, 8)
+print(h)                  // -56
+var i : u16 = uint(70000, 16)
+print(i)                  // 4464

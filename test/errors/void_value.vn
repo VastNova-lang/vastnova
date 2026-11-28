@@ -1,0 +1,3 @@
+fn nothing() {
+}
+var value = nothing()

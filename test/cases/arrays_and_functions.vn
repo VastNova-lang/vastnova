@@ -1,0 +1,30 @@
+fn sum(values : u8[3]) -> u16 {
+    var total : u16 = 0
+    var i = 0
+    while i < 3 {
+        total = total + uint(values[i], 16)
+        i = i + 1
+    }
+    return total
+}
+
+fn bump(value : i3) -> i3 {
+    return value + int(1, 3)
+}
+
+fn pick() -> i128[2] {
+    return [int(1, 128), int(2, 128)]
+}
+
+var data : u8[3] = [200, 100, 50]
+print(sum(data))
+
+var small = [uint(1, 8), uint(2, 8)]
+print(small[0] + small[1])
+
+print(bump(3))
+
+var values : i128[2] = pick()
+print(values[0] + values[1])
+
+print(sum([200, 100, 50]))

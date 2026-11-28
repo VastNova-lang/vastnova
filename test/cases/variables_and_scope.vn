@@ -1,0 +1,24 @@
+var zero
+var empty : str
+print(zero, "|", empty, "|")
+
+var value = 42
+print(value)
+
+var typed : i18 = 100000
+print(typed)
+
+var inferred : f64 = 3.5
+print(inferred)
+
+var outer = 1
+if 1 {
+    var outer = 2
+    print(outer)
+}
+print(outer)
+
+let pi = 3.25
+let folded = 10 + 2
+print(pi)
+print(folded)

@@ -1,0 +1,2 @@
+var values = [1, 2]
+print(values["0"])

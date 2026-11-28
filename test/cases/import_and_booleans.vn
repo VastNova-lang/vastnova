@@ -1,0 +1,7 @@
+import "std/bool.vn"
+
+var flag = true
+if flag {
+    print("flag is true")
+}
+print(true, false)

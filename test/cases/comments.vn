@@ -1,0 +1,8 @@
+// line comment
+# shell-style comment
+!# block comment
+   spanning lines #!
+var value = 1 // trailing comment
+# another trailing comment
+print(value)
+print("// not a comment", "# not a comment")

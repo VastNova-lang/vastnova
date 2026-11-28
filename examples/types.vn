@@ -1,4 +1,4 @@
-// Demonstrates variable types and constants
+// Demonstrates variable types, arbitrary-width integers, and constants
 // Type inference
 var a = 10         // inferred as i32
 var b = 3.14       // inferred as f64
@@ -8,6 +8,18 @@ var name = "Alice" // inferred as str
 var c : i32 = 20
 var d : f64 = 2.718
 var e : str = "Bob"
+
+// Integers can use any positive width and either signedness.
+var small : i3 = 2
+var tiny : u3 = 7
+var byte : u8 = 200
+var medium : i18 = 100000
+var huge : i128 = int(18446744073709551615, 128)
+
+// Floats are available as f16, f32, f64, and f128.
+var half : f16 = float(1.5, 16)
+var single : f32 = float(2.5, 32)
+var quad : f128 = float(3.5, 128)
 
 // Uninitialized variable (defaults to 0 or empty)
 var uninit : i32
@@ -19,7 +31,14 @@ let greeting = "Hello"    // type inferred
 
 print("a =", a, "b =", b, "name =", name)
 print("c =", c, "d =", d, "e =", e)
+print("small =", small, "tiny =", tiny, "byte =", byte)
+print("medium =", medium, "huge =", huge)
+print("half =", half, "single =", single, "quad =", quad)
 print("pi =", pi, "greeting =", greeting)
+
+// Arithmetic wraps modulo 2^N.
+print("small + 1 =", small + 1)   // 3
+print("tiny + 1 =", tiny + 1)     // 0
 
 // Attempting to reassign a constant would cause a compile error:
 // pi = 3.14   // ERROR

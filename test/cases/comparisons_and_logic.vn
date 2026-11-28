@@ -1,0 +1,26 @@
+print(3 < 5, 5 <= 5, 5 > 3, 3 >= 4, 3 == 3, 3 != 3)
+print(1.5 < 2.0, "a" == "a", "a" != "b")
+print(1 && 0, 1 || 0)
+print(0 && 1, 1 && 2, 0 || 1, 2 || 0)
+print("" || "x")
+
+if 0 {
+    print("zero is true")
+} else {
+    print("zero is false")
+}
+if "text" {
+    print("string is true")
+}
+
+fn announce() -> i32 {
+    print("called")
+    return 1
+}
+if 0 && announce() == 1 {
+    print("bad and")
+}
+print("after and")
+if 1 || announce() == 1 {
+    print("or ok")
+}

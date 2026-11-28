@@ -1,0 +1,16 @@
+print(int(300, 8))
+print(uint(-1, 8))
+print(int(7, 3))
+print(uint(70000, 16))
+print(int("-5", 8))
+print(uint("200", 8))
+print(float(1.0 / 3.0, 32))
+
+var big : i128 = int("170141183460469231731687303715884105727", 128)
+print(big)
+print(str(big))
+
+print(float("2.5"))
+print(str("abc"))
+print(int(3.9))
+print(uint(5))

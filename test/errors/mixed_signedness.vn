@@ -1,0 +1,3 @@
+var signed : i32 = 1
+var unsigned : u32 = 2
+print(signed + unsigned)

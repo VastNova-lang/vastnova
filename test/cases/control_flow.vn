@@ -1,0 +1,35 @@
+var i = 0
+while i < 10 {
+    i = i + 1
+    if i == 3 {
+        continue
+    }
+    if i == 7 {
+        break
+    }
+    print(i)
+}
+
+var n = 0
+while n < 3 {
+    var m = 0
+    while m < 3 {
+        if m == 1 {
+            m = m + 1
+            continue
+        }
+        print(n, m)
+        m = m + 1
+    }
+    n = n + 1
+}
+
+if 1 {
+    if 0 {
+        print("bad")
+    } else {
+        print("nested else")
+    }
+} else {
+    print("bad")
+}

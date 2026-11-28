@@ -1,4 +1,7 @@
 #include "CodeGen.h"
+#include "vastnova_types.h"
+#include <llvm/ADT/APFloat.h>
+#include <llvm/Config/llvm-config.h>
 #include <llvm/IR/IRBuilder.h>
 #include <llvm/IR/Module.h>
 #include <llvm/IR/LLVMContext.h>
@@ -28,9 +31,15 @@ class LLVMCodeGen {
     llvm::Function* mainFunc;
     llvm::BasicBlock* entryBB;
     std::vector<std::map<std::string, llvm::AllocaInst*>> varScopes;
+    std::vector<std::map<std::string, TypeInfo>> varTypeScopes;
     std::vector<std::map<std::string, llvm::Constant*>> constScopes;
+    std::vector<std::map<std::string, TypeInfo>> constTypeScopes;
     std::vector<std::pair<llvm::BasicBlock*, llvm::BasicBlock*>> loopStack;
+    std::map<std::string, TypeInfo> functionReturnTypes;
+    std::map<std::string, std::vector<TypeInfo>> functionParamTypes;
     std::string currentReturnType;
+    TypeInfo currentReturnInfo;
+    TypeInfo lastExprType;
     bool inMain = true;
     bool hadError = false;
 
@@ -66,23 +75,40 @@ public:
                 continue;
             }
             std::vector<llvm::Type*> paramTys;
+            std::vector<TypeInfo> paramInfos;
             bool badParam = false;
             for (auto& p : f->params) {
-                if (p.type == "void") {
+                TypeInfo pt;
+                std::string parseError;
+                if (!parseTypeInfo(p.type, pt, parseError)) {
+                    error(parseError);
+                    badParam = true;
+                    break;
+                }
+                if (pt.kind == TypeInfo::Void) {
                     error("parameter '" + p.name + "' of function '" + f->name +
                           "' cannot be void");
                     badParam = true;
                     break;
                 }
-                paramTys.push_back(mapType(p.type));
+                paramInfos.push_back(pt);
+                paramTys.push_back(llvmTypeFor(pt));
             }
             if (badParam) continue;
-            llvm::Type* retTy = mapType(f->returnType);
+            TypeInfo retInfo;
+            std::string retError;
+            if (!parseTypeInfo(f->returnType, retInfo, retError)) {
+                error(retError);
+                continue;
+            }
+            llvm::Type* retTy = llvmTypeFor(retInfo);
             auto* fnTy = llvm::FunctionType::get(retTy, paramTys, false);
             if (!module->getFunction(f->name)) {
                 llvm::Function::Create(fnTy, llvm::Function::ExternalLinkage,
                                        f->name, module.get());
             }
+            functionReturnTypes[f->name] = retInfo;
+            functionParamTypes[f->name] = paramInfos;
             validFuncs.push_back(f);
         }
 
@@ -94,11 +120,12 @@ public:
         declareStringFunctions();
 
         currentReturnType = "void";
+        currentReturnInfo = TypeInfo::voidType();
         inMain = true;
         pushScope();
         for (auto* s : mainStmts) compileStmt(s);
         builder->CreateRet(llvm::ConstantInt::get(llvm::Type::getInt32Ty(context), 0));
-        popVarScope();
+        popScope();
 
         inMain = false;
         for (auto* f : validFuncs) {
@@ -108,20 +135,24 @@ public:
             auto savedLoopStack = std::move(loopStack);
             auto* savedMainFunc = mainFunc;
             auto  savedRetType  = currentReturnType;
+            auto  savedRetInfo  = currentReturnInfo;
 
             loopStack.clear();
             mainFunc = fn;
             currentReturnType = f->returnType;
+            currentReturnInfo = functionReturnTypes[f->name];
 
             builder->SetInsertPoint(bb);
             pushScope();
 
             auto argIt = fn->arg_begin();
+            size_t paramIndex = 0;
             for (auto& p : f->params) {
-                llvm::Type* pty = mapType(p.type);
+                const TypeInfo& pt = functionParamTypes[f->name][paramIndex++];
+                llvm::Type* pty = llvmTypeFor(pt);
                 auto* alloca = builder->CreateAlloca(pty, nullptr, p.name);
                 builder->CreateStore(&*argIt, alloca);
-                declareVar(p.name, alloca);
+                declareVar(p.name, alloca, pt);
                 ++argIt;
             }
 
@@ -143,6 +174,7 @@ public:
             loopStack = std::move(savedLoopStack);
             mainFunc  = savedMainFunc;
             currentReturnType = savedRetType;
+            currentReturnInfo = savedRetInfo;
         }
 
         if (llvm::verifyModule(*module, &llvm::errs())) {
@@ -168,10 +200,22 @@ private:
         llvm::errs() << "Warning: " << msg << "\n";
     }
 
-    void pushVarScope()   { varScopes.emplace_back(); }
-    void popVarScope()    { if (!varScopes.empty()) varScopes.pop_back(); }
-    void pushConstScope() { constScopes.emplace_back(); }
-    void popConstScope()  { if (!constScopes.empty()) constScopes.pop_back(); }
+    void pushVarScope() {
+        varScopes.emplace_back();
+        varTypeScopes.emplace_back();
+    }
+    void popVarScope() {
+        if (!varScopes.empty()) varScopes.pop_back();
+        if (!varTypeScopes.empty()) varTypeScopes.pop_back();
+    }
+    void pushConstScope() {
+        constScopes.emplace_back();
+        constTypeScopes.emplace_back();
+    }
+    void popConstScope() {
+        if (!constScopes.empty()) constScopes.pop_back();
+        if (!constTypeScopes.empty()) constTypeScopes.pop_back();
+    }
     void pushScope()      { pushVarScope(); pushConstScope(); }
     void popScope()       { popVarScope(); popConstScope(); }
 
@@ -183,6 +227,14 @@ private:
         return nullptr;
     }
 
+    TypeInfo lookupVarType(const std::string& name) {
+        for (auto it = varTypeScopes.rbegin(); it != varTypeScopes.rend(); ++it) {
+            auto f = it->find(name);
+            if (f != it->end()) return f->second;
+        }
+        return TypeInfo{};
+    }
+
     llvm::Constant* lookupConst(const std::string& name) {
         for (auto it = constScopes.rbegin(); it != constScopes.rend(); ++it) {
             auto f = it->find(name);
@@ -191,7 +243,16 @@ private:
         return nullptr;
     }
 
-    bool declareVar(const std::string& name, llvm::AllocaInst* alloca) {
+    TypeInfo lookupConstType(const std::string& name) {
+        for (auto it = constTypeScopes.rbegin(); it != constTypeScopes.rend(); ++it) {
+            auto f = it->find(name);
+            if (f != it->end()) return f->second;
+        }
+        return TypeInfo{};
+    }
+
+    bool declareVar(const std::string& name, llvm::AllocaInst* alloca,
+                    const TypeInfo& type) {
         if (varScopes.empty()) return false;
         auto& cur = varScopes.back();
         if (cur.count(name)) {
@@ -203,10 +264,12 @@ private:
             return false;
         }
         cur[name] = alloca;
+        varTypeScopes.back()[name] = type;
         return true;
     }
 
-    bool declareConst(const std::string& name, llvm::Constant* c) {
+    bool declareConst(const std::string& name, llvm::Constant* c,
+                      const TypeInfo& type) {
         if (constScopes.empty()) return false;
         auto& cur = constScopes.back();
         if (cur.count(name)) {
@@ -218,6 +281,7 @@ private:
             return false;
         }
         cur[name] = c;
+        constTypeScopes.back()[name] = type;
         return true;
     }
 
@@ -243,29 +307,39 @@ private:
         return llvm::PointerType::get(context, 0);
     }
 
-    static bool splitArrayTypeName(const std::string& t, std::string& elem,
-                                   unsigned& count) {
-        size_t open = t.find('[');
-        if (open == std::string::npos) return false;
-        size_t close = t.find(']', open);
-        if (close == std::string::npos) return false;
-        elem = t.substr(0, open);
-        count = static_cast<unsigned>(std::stoul(t.substr(open + 1, close - open - 1)));
-        return true;
+    llvm::Type* llvmTypeFor(const TypeInfo& type) {
+        switch (type.kind) {
+            case TypeInfo::Int:
+                return llvm::Type::getIntNTy(context, type.bits);
+            case TypeInfo::Float:
+                if (type.bits == 16) return llvm::Type::getHalfTy(context);
+                if (type.bits == 32) return llvm::Type::getFloatTy(context);
+                if (type.bits == 128) return llvm::Type::getFP128Ty(context);
+                return llvm::Type::getDoubleTy(context);
+            case TypeInfo::Str:
+                return getInt8PtrTy();
+            case TypeInfo::Void:
+                return llvm::Type::getVoidTy(context);
+            case TypeInfo::Array:
+                if (!type.elem) return llvm::Type::getInt32Ty(context);
+                return llvm::ArrayType::get(llvmTypeFor(*type.elem), type.count);
+            default:
+                return llvm::Type::getInt32Ty(context);
+        }
+    }
+
+    llvm::Type* mapType(const TypeInfo& type) {
+        return llvmTypeFor(type);
     }
 
     llvm::Type* mapType(const std::string& t) {
-        std::string elem;
-        unsigned count = 0;
-        if (splitArrayTypeName(t, elem, count))
-            return llvm::ArrayType::get(mapType(elem), count);
-        if (t == "i32")  return llvm::Type::getInt32Ty(context);
-        if (t == "i64")  return llvm::Type::getInt64Ty(context);
-        if (t == "f32")  return llvm::Type::getFloatTy(context);
-        if (t == "f64")  return llvm::Type::getDoubleTy(context);
-        if (t == "str")  return getInt8PtrTy();
-        if (t == "void" || t.empty()) return llvm::Type::getVoidTy(context);
-        return llvm::Type::getInt32Ty(context);
+        TypeInfo type;
+        std::string parseError;
+        if (!parseTypeInfo(t, type, parseError)) {
+            error(parseError);
+            return llvm::Type::getInt32Ty(context);
+        }
+        return llvmTypeFor(type);
     }
 
     void addDefaultReturn(const std::string& retType) {
@@ -302,12 +376,249 @@ private:
         }
     }
 
-    llvm::Type* commonNumericType(llvm::Value* a, llvm::Value* b) {
-        if (a->getType()->isFloatingPointTy() || b->getType()->isFloatingPointTy())
-            return llvm::Type::getDoubleTy(context);
-        if (a->getType()->isIntegerTy(64) || b->getType()->isIntegerTy(64))
-            return llvm::Type::getInt64Ty(context);
-        return llvm::Type::getInt32Ty(context);
+    static std::string apIntToString(const llvm::APInt& value, bool isSigned) {
+#if LLVM_VERSION_MAJOR >= 16
+        llvm::SmallVector<char, 64> buffer;
+        value.toString(buffer, 10, isSigned);
+        return std::string(buffer.begin(), buffer.end());
+#else
+        return value.toString(10, isSigned);
+#endif
+    }
+
+    static double apIntToDouble(const llvm::APInt& value, bool isSigned) {
+        llvm::APFloat converted(llvm::APFloat::IEEEdouble());
+        converted.convertFromAPInt(value, isSigned,
+                                   llvm::APFloat::rmNearestTiesToEven);
+        return converted.convertToDouble();
+    }
+
+    llvm::ConstantInt* convertConstantInt(const llvm::ConstantInt* constant,
+                                          const TypeInfo& from,
+                                          const TypeInfo& to, bool& ok) {
+        ok = false;
+        if (to.kind != TypeInfo::Int) return nullptr;
+        llvm::APInt value = constant->getValue();
+        unsigned width = value.getBitWidth();
+        if (width < to.bits) width = to.bits;
+        ++width;
+        llvm::APInt extended = from.isUnsigned ? value.zext(width)
+                                               : value.sext(width);
+        llvm::APInt low;
+        llvm::APInt high;
+        if (to.isUnsigned) {
+            low = llvm::APInt(width, 0);
+            high = llvm::APInt::getMaxValue(to.bits).zext(width);
+        } else {
+            low = llvm::APInt::getSignedMinValue(to.bits).sext(width);
+            high = llvm::APInt::getSignedMaxValue(to.bits).sext(width);
+        }
+        bool fits = extended.sge(low) && extended.sle(high);
+        if (!fits) return nullptr;
+        ok = true;
+        return llvm::cast<llvm::ConstantInt>(llvm::ConstantInt::get(
+            llvm::Type::getIntNTy(context, to.bits),
+            extended.trunc(to.bits)));
+    }
+
+    llvm::Value* convertTyped(llvm::Value* value, const TypeInfo& from,
+                              const TypeInfo& to, bool explicitConversion,
+                              const std::string& where) {
+        if (!value) return nullptr;
+        if (from == to) return value;
+        std::string prefix = where.empty() ? std::string() : where + ": ";
+
+        if (from.kind == TypeInfo::Invalid || to.kind == TypeInfo::Invalid)
+            return value;
+
+        if (from.kind == TypeInfo::Array || to.kind == TypeInfo::Array) {
+            error(prefix + "array values cannot be converted");
+            return value;
+        }
+        if (from.kind == TypeInfo::Void || to.kind == TypeInfo::Void) {
+            error(prefix + "cannot convert '" + from.name() + "' to '" +
+                  to.name() + "'");
+            return value;
+        }
+        if (from.kind == TypeInfo::Str || to.kind == TypeInfo::Str) {
+            if (from.kind == TypeInfo::Str && to.kind == TypeInfo::Str)
+                return value;
+            error(prefix + "cannot convert '" + from.name() + "' to '" +
+                  to.name() + "'");
+            return value;
+        }
+
+        if (from.kind == TypeInfo::Int && to.kind == TypeInfo::Int) {
+            if (!explicitConversion) {
+                if (auto* constant = llvm::dyn_cast<llvm::ConstantInt>(value)) {
+                    bool ok = false;
+                    auto* converted = convertConstantInt(constant, from, to, ok);
+                    if (ok) return converted;
+                    error(prefix + "constant " +
+                          apIntToString(constant->getValue(), !from.isUnsigned) +
+                          " does not fit in type '" + to.name() + "'");
+                    return value;
+                }
+                if (from.isUnsigned != to.isUnsigned) {
+                    error(prefix + "cannot implicitly convert '" + from.name() +
+                          "' to '" + to.name() +
+                          "' because it changes signedness; use int() or uint()");
+                    return value;
+                }
+                if (to.bits < from.bits) {
+                    error(prefix + "narrowing from '" + from.name() + "' to '" +
+                          to.name() + "' requires an explicit conversion");
+                    return value;
+                }
+            }
+            llvm::Type* targetTy = llvm::Type::getIntNTy(context, to.bits);
+            if (to.bits > from.bits)
+                return from.isUnsigned ? builder->CreateZExt(value, targetTy)
+                                       : builder->CreateSExt(value, targetTy);
+            if (to.bits < from.bits)
+                return builder->CreateTrunc(value, targetTy);
+            return value;
+        }
+
+        if (from.kind == TypeInfo::Int && to.kind == TypeInfo::Float) {
+            llvm::Type* targetTy = llvmTypeFor(to);
+            return from.isUnsigned ? builder->CreateUIToFP(value, targetTy)
+                                   : builder->CreateSIToFP(value, targetTy);
+        }
+
+        if (from.kind == TypeInfo::Float && to.kind == TypeInfo::Int) {
+            if (!explicitConversion) {
+                error(prefix + "converting '" + from.name() + "' to '" +
+                      to.name() + "' requires int() or uint()");
+                return value;
+            }
+            llvm::Type* targetTy = llvmTypeFor(to);
+            return to.isUnsigned ? builder->CreateFPToUI(value, targetTy)
+                                 : builder->CreateFPToSI(value, targetTy);
+        }
+
+        if (from.kind == TypeInfo::Float && to.kind == TypeInfo::Float) {
+            llvm::Type* targetTy = llvmTypeFor(to);
+            if (to.bits > from.bits)
+                return builder->CreateFPExt(value, targetTy);
+            if (to.bits < from.bits)
+                return builder->CreateFPTrunc(value, targetTy);
+            return value;
+        }
+
+        error(prefix + "cannot convert '" + from.name() + "' to '" +
+              to.name() + "'");
+        return value;
+    }
+
+    llvm::Constant* convertConstantTyped(llvm::Constant* constant,
+                                         const TypeInfo& from,
+                                         const TypeInfo& to,
+                                         const std::string& name) {
+        if (from == to) return constant;
+        if (auto* ci = llvm::dyn_cast<llvm::ConstantInt>(constant)) {
+            if (to.kind == TypeInfo::Int) {
+                bool ok = false;
+                auto* converted = convertConstantInt(ci, from, to, ok);
+                if (ok) return converted;
+                error("constant '" + name + "' value " +
+                      apIntToString(ci->getValue(), !from.isUnsigned) +
+                      " does not fit in type '" + to.name() + "'");
+                return constant;
+            }
+            if (to.kind == TypeInfo::Float) {
+                double number =
+                    apIntToDouble(ci->getValue(), !from.isUnsigned);
+                return llvm::ConstantFP::get(llvmTypeFor(to), number);
+            }
+        }
+        if (auto* cf = llvm::dyn_cast<llvm::ConstantFP>(constant)) {
+            if (to.kind == TypeInfo::Float)
+                return llvm::ConstantFP::get(llvmTypeFor(to),
+                    cf->getValueAPF().convertToDouble());
+            if (to.kind == TypeInfo::Int) {
+                error("constant '" + name + "' of type '" + from.name() +
+                      "' requires an explicit conversion to '" + to.name() +
+                      "' with int() or uint()");
+                return constant;
+            }
+        }
+        error("constant '" + name + "' has an incompatible declared type");
+        return constant;
+    }
+
+    bool mergeNumericTypes(TypeInfo& leftType, TypeInfo& rightType,
+                           llvm::Value*& leftValue, llvm::Value*& rightValue,
+                           TypeInfo& result, std::string& error) {
+        if (leftType.kind == TypeInfo::Str || rightType.kind == TypeInfo::Str) {
+            if (leftType.kind == TypeInfo::Str &&
+                rightType.kind == TypeInfo::Str) {
+                result = TypeInfo::strType();
+                return true;
+            }
+            error = "cannot mix a string with a number";
+            return false;
+        }
+        if (leftType.kind == TypeInfo::Float ||
+            rightType.kind == TypeInfo::Float) {
+            if (leftType.kind == TypeInfo::Float &&
+                rightType.kind == TypeInfo::Float) {
+                result = TypeInfo::floatType(
+                    leftType.bits > rightType.bits ? leftType.bits
+                                                   : rightType.bits);
+                return true;
+            }
+            if (leftType.kind == TypeInfo::Int && rightType.kind == TypeInfo::Float) {
+                result = TypeInfo::floatType(64);
+                return true;
+            }
+            if (leftType.kind == TypeInfo::Float && rightType.kind == TypeInfo::Int) {
+                result = TypeInfo::floatType(64);
+                return true;
+            }
+            error = "cannot mix a number with a string";
+            return false;
+        }
+
+        if (leftType.kind != TypeInfo::Int || rightType.kind != TypeInfo::Int) {
+            error = "operator requires numeric operands";
+            return false;
+        }
+
+        auto adaptConstant = [&](TypeInfo& from, TypeInfo& to,
+                                 llvm::Value*& value) -> bool {
+            auto* constant = llvm::dyn_cast<llvm::ConstantInt>(value);
+            if (!constant || to.kind != TypeInfo::Int) return false;
+            bool ok = false;
+            auto* converted = convertConstantInt(constant, from, to, ok);
+            if (!ok) return false;
+            value = converted;
+            from = to;
+            return true;
+        };
+
+        bool leftConstant = llvm::isa<llvm::ConstantInt>(leftValue);
+        bool rightConstant = llvm::isa<llvm::ConstantInt>(rightValue);
+        if (leftConstant && !rightConstant) {
+            adaptConstant(leftType, rightType, leftValue);
+        } else if (rightConstant && !leftConstant) {
+            adaptConstant(rightType, leftType, rightValue);
+        } else if (leftConstant && rightConstant && leftType != rightType) {
+            if (!adaptConstant(leftType, rightType, leftValue))
+                adaptConstant(rightType, leftType, rightValue);
+        }
+
+        if (leftType.isUnsigned != rightType.isUnsigned) {
+            error = "cannot mix signed '" + leftType.name() +
+                    "' with unsigned '" + rightType.name() +
+                    "'; convert one operand explicitly with int() or uint()";
+            return false;
+        }
+
+        result = TypeInfo::intType(
+            leftType.bits > rightType.bits ? leftType.bits : rightType.bits,
+            leftType.isUnsigned);
+        return true;
     }
 
     llvm::Value* toBool(llvm::Value* v) {
@@ -392,81 +703,229 @@ private:
         module->getOrInsertFunction("atof", atofType);
     }
 
-    llvm::Value* convertValue(llvm::Value* val, llvm::Type* targetTy) {
-        if (val->getType() == targetTy) return val;
-        if (val->getType()->isArrayTy() || targetTy->isArrayTy()) {
-            error("array values cannot be converted");
-            return val;
+    llvm::Function* integerToStringFunction(const TypeInfo& type) {
+        std::string name = std::string("__vn_itoa_") +
+                           (type.isUnsigned ? "u" : "i") +
+                           std::to_string(type.bits);
+        if (auto* existing = module->getFunction(name)) return existing;
+
+        auto savedIP = builder->saveIP();
+        auto* i8Ty = llvm::Type::getInt8Ty(context);
+        auto* i32Ty = llvm::Type::getInt32Ty(context);
+        auto* i64Ty = llvm::Type::getInt64Ty(context);
+        unsigned workBits = type.bits < 8 ? 8 : type.bits;
+        if (!type.isUnsigned) ++workBits;
+        auto* workTy = llvm::Type::getIntNTy(context, workBits);
+        auto* valueTy = llvm::Type::getIntNTy(context, type.bits);
+        auto* fn = llvm::Function::Create(
+            llvm::FunctionType::get(getInt8PtrTy(), {valueTy}, false),
+            llvm::Function::PrivateLinkage, name, module.get());
+
+        auto* entry = llvm::BasicBlock::Create(context, "entry", fn);
+        auto* loopBB = llvm::BasicBlock::Create(context, "digits", fn);
+        auto* doneBB = llvm::BasicBlock::Create(context, "done", fn);
+        auto* copyHead = llvm::BasicBlock::Create(context, "copy_head", fn);
+        auto* copyBody = llvm::BasicBlock::Create(context, "copy_body", fn);
+        auto* finishBB = llvm::BasicBlock::Create(context, "finish", fn);
+        builder->SetInsertPoint(entry);
+
+        llvm::Argument* argument = fn->arg_begin();
+        llvm::Value* negative = nullptr;
+        llvm::Value* magnitude = nullptr;
+        if (type.isUnsigned) {
+            negative = llvm::ConstantInt::getFalse(context);
+            magnitude = builder->CreateZExt(argument, workTy, "mag");
+        } else {
+            auto* extended = builder->CreateSExt(argument, workTy, "signed");
+            negative = builder->CreateICmpSLT(
+                extended, llvm::ConstantInt::get(workTy, 0), "neg");
+            auto* negated = builder->CreateNeg(extended, "neg_mag");
+            magnitude = builder->CreateSelect(
+                negative, negated, extended, "mag");
         }
-        if (targetTy->isIntegerTy()) {
-            if (val->getType()->isIntegerTy()) {
-                if (targetTy->getIntegerBitWidth() > val->getType()->getIntegerBitWidth())
-                    return builder->CreateSExt(val, targetTy);
-                else
-                    return builder->CreateTrunc(val, targetTy);
-            } else if (val->getType()->isFloatingPointTy()) {
-                return builder->CreateFPToSI(val, targetTy);
-            } else if (val->getType()->isPointerTy()) {
-                error("cannot convert a string to a number");
-                return val;
-            }
-        } else if (targetTy->isFloatingPointTy()) {
-            if (val->getType()->isIntegerTy()) {
-                return builder->CreateSIToFP(val, targetTy);
-            } else if (val->getType()->isFloatingPointTy()) {
-                if (targetTy->getFPMantissaWidth() > val->getType()->getFPMantissaWidth())
-                    return builder->CreateFPExt(val, targetTy);
-                else
-                    return builder->CreateFPTrunc(val, targetTy);
-            }
-        } else if (targetTy->isPointerTy()) {
-            if (val->getType()->isIntegerTy()) {
-                error("cannot convert a number to a string");
-                return val;
-            }
-        }
-        return val;
+
+        unsigned maxDigits = type.bits / 3 + 3;
+        auto* bufferTy = llvm::ArrayType::get(i8Ty, maxDigits);
+        auto* digits = builder->CreateAlloca(bufferTy, nullptr, "digits");
+        auto* magSlot = builder->CreateAlloca(workTy, nullptr, "mag_slot");
+        auto* idxSlot = builder->CreateAlloca(i64Ty, nullptr, "idx_slot");
+        builder->CreateStore(magnitude, magSlot);
+        builder->CreateStore(llvm::ConstantInt::get(i64Ty, 0), idxSlot);
+        builder->CreateBr(loopBB);
+
+        builder->SetInsertPoint(loopBB);
+        auto* mag = builder->CreateLoad(workTy, magSlot, "mag_val");
+        auto* idx = builder->CreateLoad(i64Ty, idxSlot, "idx_val");
+        auto* ten = llvm::ConstantInt::get(workTy, 10);
+        auto* digit = builder->CreateURem(mag, ten, "digit");
+        auto* digit8 = builder->CreateTrunc(digit, i8Ty, "digit8");
+        auto* ch = builder->CreateAdd(
+            digit8, llvm::ConstantInt::get(i8Ty, '0'), "digit_ch");
+        auto* slot = builder->CreateInBoundsGEP(
+            bufferTy, digits,
+            {llvm::ConstantInt::get(i32Ty, 0), idx}, "digit_slot");
+        builder->CreateStore(ch, slot);
+        auto* next = builder->CreateUDiv(mag, ten, "mag_next");
+        builder->CreateStore(next, magSlot);
+        auto* idxNext = builder->CreateAdd(
+            idx, llvm::ConstantInt::get(i64Ty, 1), "idx_next");
+        builder->CreateStore(idxNext, idxSlot);
+        auto* zero = builder->CreateICmpEQ(
+            next, llvm::ConstantInt::get(workTy, 0), "mag_zero");
+        builder->CreateCondBr(zero, doneBB, loopBB);
+
+        builder->SetInsertPoint(doneBB);
+        auto* finalIdx = builder->CreateLoad(i64Ty, idxSlot, "idx_final");
+        auto* negative64 = builder->CreateZExt(negative, i64Ty, "neg64");
+        auto* total = builder->CreateAdd(finalIdx, negative64, "total_len");
+        auto* allocSize = builder->CreateAdd(
+            total, llvm::ConstantInt::get(i64Ty, 1), "alloc_size");
+        auto* mallocFn = module->getFunction("malloc");
+        auto* buffer = builder->CreateCall(mallocFn, {allocSize}, "itoa_buf");
+        builder->CreateStore(
+            llvm::ConstantInt::get(i8Ty, '-'),
+            builder->CreateInBoundsGEP(
+                i8Ty, buffer, llvm::ConstantInt::get(i64Ty, 0), "buf0"));
+        auto* offset = builder->CreateZExt(negative, i64Ty, "offset");
+        auto* outStart = builder->CreateInBoundsGEP(i8Ty, buffer, offset, "out_start");
+        auto* outSlot = builder->CreateAlloca(getInt8PtrTy(), nullptr, "out_slot");
+        builder->CreateStore(outStart, outSlot);
+        auto* jSlot = builder->CreateAlloca(i64Ty, nullptr, "j_slot");
+        builder->CreateStore(finalIdx, jSlot);
+        builder->CreateBr(copyHead);
+
+        builder->SetInsertPoint(copyHead);
+        auto* j = builder->CreateLoad(i64Ty, jSlot, "j");
+        auto* jZero = builder->CreateICmpEQ(
+            j, llvm::ConstantInt::get(i64Ty, 0), "j_zero");
+        builder->CreateCondBr(jZero, finishBB, copyBody);
+
+        builder->SetInsertPoint(copyBody);
+        auto* jPrev = builder->CreateSub(
+            j, llvm::ConstantInt::get(i64Ty, 1), "j_prev");
+        builder->CreateStore(jPrev, jSlot);
+        auto* source = builder->CreateInBoundsGEP(
+            bufferTy, digits,
+            {llvm::ConstantInt::get(i32Ty, 0), jPrev}, "src");
+        auto* sourceChar = builder->CreateLoad(i8Ty, source, "src_ch");
+        auto* outPtr = builder->CreateLoad(getInt8PtrTy(), outSlot, "out_ptr");
+        builder->CreateStore(sourceChar, outPtr);
+        auto* outNext = builder->CreateInBoundsGEP(
+            i8Ty, outPtr, llvm::ConstantInt::get(i64Ty, 1), "out_next");
+        builder->CreateStore(outNext, outSlot);
+        builder->CreateBr(copyHead);
+
+        builder->SetInsertPoint(finishBB);
+        auto* endPtr = builder->CreateLoad(getInt8PtrTy(), outSlot, "end_ptr");
+        builder->CreateStore(llvm::ConstantInt::get(i8Ty, 0), endPtr);
+        builder->CreateRet(buffer);
+
+        builder->restoreIP(savedIP);
+        return fn;
     }
 
-    llvm::Constant* convertConstant(llvm::Constant* c, llvm::Type* ty,
-                                    const std::string& name) {
-        llvm::Type* from = c->getType();
-        if (from == ty) return c;
-        if (auto* ci = llvm::dyn_cast<llvm::ConstantInt>(c)) {
-            if (ty->isIntegerTy())
-                return llvm::ConstantInt::get(ty, ci->getSExtValue(), true);
-            if (ty->isFloatingPointTy())
-                return llvm::ConstantFP::get(ty, (double)ci->getSExtValue());
-        }
-        if (auto* cf = llvm::dyn_cast<llvm::ConstantFP>(c)) {
-            if (ty->isIntegerTy())
-                return llvm::ConstantInt::get(
-                    ty, (int64_t)cf->getValueAPF().convertToDouble(), true);
-            if (ty->isFloatingPointTy())
-                return llvm::ConstantFP::get(
-                    ty, cf->getValueAPF().convertToDouble());
-        }
-        error("constant '" + name + "' has an incompatible declared type");
-        return c;
+    llvm::Function* integerFromStringFunction(const TypeInfo& type) {
+        std::string name = std::string("__vn_atoi_") +
+                           (type.isUnsigned ? "u" : "i") +
+                           std::to_string(type.bits);
+        if (auto* existing = module->getFunction(name)) return existing;
+
+        auto savedIP = builder->saveIP();
+        auto* i8Ty = llvm::Type::getInt8Ty(context);
+        auto* i64Ty = llvm::Type::getInt64Ty(context);
+        auto* valueTy = llvm::Type::getIntNTy(context, type.bits);
+        auto* fn = llvm::Function::Create(
+            llvm::FunctionType::get(valueTy, {getInt8PtrTy()}, false),
+            llvm::Function::PrivateLinkage, name, module.get());
+
+        auto* entry = llvm::BasicBlock::Create(context, "entry", fn);
+        auto* loopBB = llvm::BasicBlock::Create(context, "digits", fn);
+        auto* bodyBB = llvm::BasicBlock::Create(context, "digit", fn);
+        auto* doneBB = llvm::BasicBlock::Create(context, "done", fn);
+        builder->SetInsertPoint(entry);
+
+        llvm::Argument* argument = fn->arg_begin();
+        auto* first = builder->CreateLoad(i8Ty, argument, "first");
+        auto* negative = builder->CreateICmpEQ(
+            first, llvm::ConstantInt::get(i8Ty, '-'), "negative");
+        auto* start = builder->CreateSelect(
+            negative, llvm::ConstantInt::get(i64Ty, 1),
+            llvm::ConstantInt::get(i64Ty, 0), "start");
+        auto* indexSlot = builder->CreateAlloca(i64Ty, nullptr, "index_slot");
+        auto* valueSlot = builder->CreateAlloca(valueTy, nullptr, "value_slot");
+        auto* negativeSlot = builder->CreateAlloca(
+            llvm::Type::getInt1Ty(context), nullptr, "negative_slot");
+        builder->CreateStore(start, indexSlot);
+        builder->CreateStore(llvm::ConstantInt::get(valueTy, 0), valueSlot);
+        builder->CreateStore(negative, negativeSlot);
+        builder->CreateBr(loopBB);
+
+        builder->SetInsertPoint(loopBB);
+        auto* index = builder->CreateLoad(i64Ty, indexSlot, "index");
+        auto* charPtr = builder->CreateInBoundsGEP(
+            i8Ty, argument, index, "char_ptr");
+        auto* ch = builder->CreateLoad(i8Ty, charPtr, "char");
+        auto* atLeastZero = builder->CreateICmpUGE(
+            ch, llvm::ConstantInt::get(i8Ty, '0'), "digit_low");
+        auto* atMostNine = builder->CreateICmpULE(
+            ch, llvm::ConstantInt::get(i8Ty, '9'), "digit_high");
+        auto* isDigit = builder->CreateAnd(atLeastZero, atMostNine, "is_digit");
+        builder->CreateCondBr(isDigit, bodyBB, doneBB);
+
+        builder->SetInsertPoint(bodyBB);
+        auto* value = builder->CreateLoad(valueTy, valueSlot, "value");
+        auto* digit = builder->CreateSub(
+            builder->CreateZExt(ch, valueTy), 
+            llvm::ConstantInt::get(valueTy, '0'), "digit");
+        auto* scaled = builder->CreateMul(
+            value, llvm::ConstantInt::get(valueTy, 10), "scaled");
+        auto* next = builder->CreateAdd(scaled, digit, "next");
+        builder->CreateStore(next, valueSlot);
+        builder->CreateStore(
+            builder->CreateAdd(index, llvm::ConstantInt::get(i64Ty, 1)),
+            indexSlot);
+        builder->CreateBr(loopBB);
+
+        builder->SetInsertPoint(doneBB);
+        auto* result = builder->CreateLoad(valueTy, valueSlot, "result");
+        auto* wasNegative = builder->CreateLoad(
+            llvm::Type::getInt1Ty(context), negativeSlot, "was_negative");
+        auto* negated = builder->CreateNeg(result, "negated");
+        auto* finalValue = builder->CreateSelect(
+            wasNegative, negated, result, "final");
+        builder->CreateRet(finalValue);
+
+        builder->restoreIP(savedIP);
+        return fn;
     }
 
-    llvm::Value* compileStr(llvm::Value* value) {
+    llvm::Value* compileStr(llvm::Value* value, const TypeInfo& type) {
         if (!value) return nullptr;
-        if (value->getType()->isPointerTy()) return value;
+        if (type.kind == TypeInfo::Str) return value;
+
+        if (type.kind == TypeInfo::Int && type.bits > 64) {
+            auto* fn = integerToStringFunction(type);
+            return builder->CreateCall(fn, {value}, "int_str");
+        }
 
         llvm::Type* bufType = llvm::ArrayType::get(llvm::Type::getInt8Ty(context), 64);
         auto bufAlloca = builder->CreateAlloca(bufType, nullptr, "str_buf");
         auto bufPtr = builder->CreatePointerCast(bufAlloca, getInt8PtrTy());
 
         std::string formatStr;
-        if (value->getType()->isIntegerTy()) {
-            formatStr = "%lld";
-            if (value->getType()->getIntegerBitWidth() < 64)
-                value = builder->CreateSExt(value, llvm::Type::getInt64Ty(context));
-        } else if (value->getType()->isFloatingPointTy()) {
+        if (type.kind == TypeInfo::Int) {
+            formatStr = type.isUnsigned ? "%llu" : "%lld";
+            if (type.bits < 64) {
+                value = type.isUnsigned
+                    ? builder->CreateZExt(value, llvm::Type::getInt64Ty(context))
+                    : builder->CreateSExt(value, llvm::Type::getInt64Ty(context));
+            }
+        } else if (type.kind == TypeInfo::Float) {
             formatStr = "%g";
-            if (value->getType()->isFloatTy())
+            if (type.bits == 16 || type.bits == 32)
                 value = builder->CreateFPExt(value, llvm::Type::getDoubleTy(context));
+            else if (type.bits == 128)
+                value = builder->CreateFPTrunc(value, llvm::Type::getDoubleTy(context));
         } else {
             error("str() cannot convert this value");
             return nullptr;
@@ -493,36 +952,74 @@ private:
         return result;
     }
 
-    llvm::Value* compileInt(const Call* call) {
-        if (call->args.size() != 1) {
-            error("int() expects one argument");
+    unsigned conversionWidth(const Call* call, unsigned defaultWidth) {
+        if (call->args.size() < 2) return defaultWidth;
+        auto* number = static_cast<const Number*>(call->args[1].get());
+        if (!number) return defaultWidth;
+        return static_cast<unsigned>(std::stoul(number->value));
+    }
+
+    llvm::Value* compileIntegerConversion(const Call* call, bool unsignedTarget) {
+        if (call->args.empty() || call->args.size() > 2) {
+            error(std::string(unsignedTarget ? "uint" : "int") +
+                  "() expects one argument and an optional width");
             return nullptr;
         }
+        unsigned bits = conversionWidth(call, 32);
+        TypeInfo target = TypeInfo::intType(bits, unsignedTarget);
         auto arg = compileExpr(call->args[0].get());
         if (!arg) return nullptr;
-        if (arg->getType()->isPointerTy()) {
-            auto atoiFn = module->getFunction("atoi");
-            return builder->CreateCall(atoiFn, {arg});
-        } else if (arg->getType()->isIntegerTy() || arg->getType()->isFloatingPointTy()) {
-            return convertValue(arg, llvm::Type::getInt32Ty(context));
+        TypeInfo from = lastExprType;
+
+        if (from.kind == TypeInfo::Str) {
+            if (bits > 64) {
+                auto* fn = integerFromStringFunction(target);
+                return builder->CreateCall(fn, {arg}, "parsed_int");
+            }
+            auto* i64Ty = llvm::Type::getInt64Ty(context);
+            auto callee = module->getOrInsertFunction(
+                unsignedTarget ? "strtoull" : "strtoll",
+                llvm::FunctionType::get(i64Ty,
+                    {getInt8PtrTy(), getInt8PtrTy(),
+                     llvm::Type::getInt32Ty(context)}, false));
+            auto* parsed = builder->CreateCall(callee, {
+                arg,
+                llvm::ConstantPointerNull::get(getInt8PtrTy()),
+                llvm::ConstantInt::get(llvm::Type::getInt32Ty(context), 10)
+            }, "parsed_int");
+            return convertTyped(parsed, TypeInfo::intType(64, unsignedTarget),
+                                target, true, "conversion");
         }
-        error("int() cannot convert this value");
+
+        if (from.kind == TypeInfo::Int || from.kind == TypeInfo::Float)
+            return convertTyped(arg, from, target, true, "conversion");
+
+        error(std::string(unsignedTarget ? "uint" : "int") +
+              "() cannot convert this value");
         return nullptr;
     }
 
     llvm::Value* compileFloat(const Call* call) {
-        if (call->args.size() != 1) {
-            error("float() expects one argument");
+        if (call->args.empty() || call->args.size() > 2) {
+            error("float() expects one argument and an optional width");
             return nullptr;
         }
+        unsigned bits = conversionWidth(call, 64);
+        TypeInfo target = TypeInfo::floatType(bits);
         auto arg = compileExpr(call->args[0].get());
         if (!arg) return nullptr;
-        if (arg->getType()->isPointerTy()) {
-            auto atofFn = module->getFunction("atof");
-            return builder->CreateCall(atofFn, {arg});
-        } else if (arg->getType()->isIntegerTy() || arg->getType()->isFloatingPointTy()) {
-            return convertValue(arg, llvm::Type::getDoubleTy(context));
+        TypeInfo from = lastExprType;
+
+        if (from.kind == TypeInfo::Str) {
+            auto* atofFn = module->getFunction("atof");
+            auto* parsed = builder->CreateCall(atofFn, {arg}, "parsed_float");
+            return convertTyped(parsed, TypeInfo::floatType(64), target, true,
+                                "conversion");
         }
+
+        if (from.kind == TypeInfo::Int || from.kind == TypeInfo::Float)
+            return convertTyped(arg, from, target, true, "conversion");
+
         error("float() cannot convert this value");
         return nullptr;
     }
@@ -677,23 +1174,6 @@ private:
         return builder->CreateZExt(cmpZero, llvm::Type::getInt32Ty(context));
     }
 
-    llvm::Type* mergeElementType(llvm::Type* acc, llvm::Type* ty) {
-        if (!acc) return ty;
-        if (acc->isPointerTy() || ty->isPointerTy())
-            return acc->isPointerTy() && ty->isPointerTy() ? acc : nullptr;
-        if (acc->isFloatingPointTy() || ty->isFloatingPointTy()) {
-            llvm::Type* f = acc->isFloatingPointTy() ? acc : ty;
-            llvm::Type* other = acc->isFloatingPointTy() ? ty : acc;
-            if (other->isFloatingPointTy() &&
-                other->getFPMantissaWidth() > f->getFPMantissaWidth())
-                f = other;
-            return f;
-        }
-        if (acc->isIntegerTy(64) || ty->isIntegerTy(64))
-            return llvm::Type::getInt64Ty(context);
-        return llvm::Type::getInt32Ty(context);
-    }
-
     static std::string targetVarName(const ASTNode* node) {
         if (node->type == NodeType::Variable)
             return static_cast<const Variable*>(node)->name;
@@ -702,7 +1182,7 @@ private:
         return "";
     }
 
-    llvm::Value* compileLValue(const ASTNode* node, llvm::Type** outTy) {
+    llvm::Value* compileLValue(const ASTNode* node, TypeInfo& outTy) {
         if (node->type == NodeType::Variable) {
             auto* var = static_cast<const Variable*>(node);
             if (lookupConst(var->name)) {
@@ -714,20 +1194,20 @@ private:
                 error("unknown variable '" + var->name + "'");
                 return nullptr;
             }
-            *outTy = alloca->getAllocatedType();
+            outTy = lookupVarType(var->name);
             return alloca;
         }
         if (node->type == NodeType::IndexExpr) {
             auto* ix = static_cast<const IndexExpr*>(node);
-            llvm::Type* baseTy = nullptr;
-            auto* basePtr = compileLValue(ix->base.get(), &baseTy);
+            TypeInfo baseTy;
+            auto* basePtr = compileLValue(ix->base.get(), baseTy);
             if (!basePtr) return nullptr;
-            if (baseTy->isPointerTy()) {
+            if (baseTy.kind == TypeInfo::Str) {
                 error("cannot assign to a character of a string; "
                       "strings are immutable");
                 return nullptr;
             }
-            if (!baseTy->isArrayTy()) {
+            if (baseTy.kind != TypeInfo::Array || !baseTy.elem) {
                 error("cannot index a non-array value");
                 return nullptr;
             }
@@ -737,9 +1217,9 @@ private:
                 error("array index must be an integer");
                 return nullptr;
             }
-            *outTy = baseTy->getArrayElementType();
+            outTy = *baseTy.elem;
             return builder->CreateInBoundsGEP(
-                baseTy, basePtr,
+                llvmTypeFor(baseTy), basePtr,
                 {llvm::ConstantInt::get(llvm::Type::getInt32Ty(context), 0), index},
                 "elem_ptr");
         }
@@ -747,62 +1227,114 @@ private:
         return nullptr;
     }
 
-    llvm::Value* buildArrayInitializer(const ArrayLiteral* lit, llvm::Type* arrTy,
-                                       const std::string& name, bool& failed) {
-        auto* elemTy = arrTy->getArrayElementType();
+    bool compileArrayElements(const ArrayLiteral* lit, const std::string& where,
+                              std::vector<llvm::Value*>& values,
+                              std::vector<TypeInfo>& types) {
+        for (auto& element : lit->elements) {
+            auto* value = compileExpr(element.get());
+            if (!value) return false;
+            TypeInfo type = lastExprType;
+            if (type.kind == TypeInfo::Void || type.kind == TypeInfo::Array) {
+                error("invalid element in the initializer of " + where);
+                return false;
+            }
+            values.push_back(value);
+            types.push_back(type);
+        }
+        return true;
+    }
+
+    TypeInfo inferArrayElementType(std::vector<llvm::Value*>& values,
+                                   std::vector<TypeInfo>& types,
+                                   const std::string& where, bool& ok) {
+        ok = false;
+        if (values.empty()) {
+            error("array literal for " + where + " cannot be empty");
+            return TypeInfo{};
+        }
+        TypeInfo result = types[0];
+        llvm::Value* representative = values[0];
+        for (size_t i = 1; i < values.size(); ++i) {
+            TypeInfo rightType = types[i];
+            llvm::Value* rightValue = values[i];
+            TypeInfo merged;
+            std::string mergeError;
+            if (!mergeNumericTypes(result, rightType, representative, rightValue,
+                                   merged, mergeError)) {
+                error(where + ": " + mergeError);
+                return TypeInfo{};
+            }
+            result = merged;
+            if (!llvm::isa<llvm::ConstantInt>(rightValue) &&
+                !llvm::isa<llvm::ConstantFP>(rightValue) &&
+                rightType.kind != TypeInfo::Str)
+                representative = rightValue;
+        }
+        ok = true;
+        return result;
+    }
+
+    llvm::Value* buildArrayFromValues(const std::vector<llvm::Value*>& values,
+                                      const std::vector<TypeInfo>& types,
+                                      const TypeInfo& arrayType,
+                                      const std::string& where, bool& failed) {
+        failed = false;
+        if (!arrayType.elem) {
+            error(where + " has an invalid array type");
+            failed = true;
+            return nullptr;
+        }
         std::vector<llvm::Value*> elems;
-        for (auto& e : lit->elements) {
-            auto v = compileExpr(e.get());
-            if (!v) { failed = true; return nullptr; }
-            if (v->getType()->isVoidTy() || v->getType()->isArrayTy()) {
-                error("invalid element in the initializer of array '" + name + "'");
+        for (size_t i = 0; i < values.size(); ++i) {
+            auto* value = convertTyped(values[i], types[i], *arrayType.elem,
+                                       false, where + " element " +
+                                       std::to_string(i + 1));
+            if (!value || value->getType() != llvmTypeFor(*arrayType.elem)) {
                 failed = true;
                 return nullptr;
             }
-            if (v->getType() != elemTy) {
-                v = convertValue(v, elemTy);
-                if (v->getType() != elemTy) { failed = true; return nullptr; }
-            }
-            elems.push_back(v);
+            elems.push_back(value);
         }
 
         bool allConstant = true;
-        for (auto* v : elems)
-            if (!llvm::isa<llvm::Constant>(v)) allConstant = false;
+        for (auto* value : elems)
+            if (!llvm::isa<llvm::Constant>(value)) allConstant = false;
 
+        auto* llvmArrayTy = llvm::cast<llvm::ArrayType>(llvmTypeFor(arrayType));
         if (allConstant) {
-            std::vector<llvm::Constant*> consts;
-            for (auto* v : elems) consts.push_back(llvm::cast<llvm::Constant>(v));
-            return llvm::ConstantArray::get(
-                llvm::cast<llvm::ArrayType>(arrTy), consts);
+            std::vector<llvm::Constant*> constants;
+            for (auto* value : elems)
+                constants.push_back(llvm::cast<llvm::Constant>(value));
+            return llvm::ConstantArray::get(llvmArrayTy, constants);
         }
 
-        llvm::Value* agg = llvm::UndefValue::get(arrTy);
+        llvm::Value* aggregate = llvm::UndefValue::get(llvmArrayTy);
         for (size_t i = 0; i < elems.size(); ++i) {
-            agg = builder->CreateInsertValue(
-                agg, elems[i], {static_cast<unsigned>(i)}, "elem_init");
+            aggregate = builder->CreateInsertValue(
+                aggregate, elems[i], {static_cast<unsigned>(i)}, "elem_init");
         }
-        return agg;
+        return aggregate;
     }
 
     // Array values are handled by value: an array variable is loaded as a whole
     // aggregate, an array literal is materialized at the expected type, and any
     // other expression (such as a call) must produce exactly the expected type.
-    llvm::Value* compileArrayValue(const ASTNode* node, llvm::Type* expectedTy,
+    llvm::Value* compileArrayValue(const ASTNode* node, const TypeInfo& expected,
                                    const std::string& where) {
-        auto* arrTy = llvm::cast<llvm::ArrayType>(expectedTy);
-
         if (node->type == NodeType::ArrayLiteral) {
             auto* lit = static_cast<const ArrayLiteral*>(node);
-            if (lit->elements.size() != arrTy->getNumElements()) {
-                error(where + " expects " +
-                      std::to_string(arrTy->getNumElements()) +
+            if (lit->elements.size() != expected.count) {
+                error(where + " expects " + std::to_string(expected.count) +
                       " element(s), but the array literal has " +
                       std::to_string(lit->elements.size()));
                 return nullptr;
             }
+            std::vector<llvm::Value*> values;
+            std::vector<TypeInfo> types;
+            if (!compileArrayElements(lit, where, values, types)) return nullptr;
             bool failed = false;
-            auto* value = buildArrayInitializer(lit, arrTy, where, failed);
+            auto* value = buildArrayFromValues(values, types, expected, where,
+                                               failed);
             return failed ? nullptr : value;
         }
 
@@ -813,17 +1345,17 @@ private:
                 error("unknown variable '" + var->name + "'");
                 return nullptr;
             }
-            if (alloca->getAllocatedType() != expectedTy) {
+            if (lookupVarType(var->name) != expected) {
                 error(where + " requires an array of the exact expected type; '" +
                       var->name + "' does not match");
                 return nullptr;
             }
-            return builder->CreateLoad(arrTy, alloca, var->name);
+            return builder->CreateLoad(llvmTypeFor(expected), alloca, var->name);
         }
 
         auto* value = compileExpr(node);
         if (!value) return nullptr;
-        if (value->getType() != expectedTy) {
+        if (lastExprType != expected) {
             error(where + " requires an array of the exact expected type; "
                   "the value does not match");
             return nullptr;
@@ -832,40 +1364,74 @@ private:
     }
 
     llvm::Value* compileExpr(const ASTNode* node) {
+        TypeInfo type;
+        auto* value = compileExprTyped(node, type);
+        lastExprType = value ? type : TypeInfo{};
+        return value;
+    }
+
+    llvm::Value* compileExprTyped(const ASTNode* node, TypeInfo& outType) {
         switch (node->type) {
             case NodeType::Number: {
                 auto* num = static_cast<const Number*>(node);
                 if (num->value.find('.') != std::string::npos) {
-                    return llvm::ConstantFP::get(llvm::Type::getDoubleTy(context),
-                                                 std::stod(num->value));
-                } else {
-                    int64_t val = std::stoll(num->value);
-                    if (val > INT32_MAX || val < INT32_MIN) {
-                        return llvm::ConstantInt::get(
-                            llvm::Type::getInt64Ty(context), val, true);
+                    double number = 0.0;
+                    try {
+                        number = std::stod(num->value);
+                    } catch (...) {
+                        error("invalid floating-point literal '" + num->value + "'");
+                        return nullptr;
                     }
-                    return llvm::ConstantInt::get(
-                        llvm::Type::getInt32Ty(context), val, true);
+                    outType = TypeInfo::floatType(64);
+                    return llvm::ConstantFP::get(
+                        llvm::Type::getDoubleTy(context), number);
                 }
+                uint64_t value = 0;
+                for (char c : num->value) {
+                    unsigned digit = static_cast<unsigned>(c - '0');
+                    if (value > (UINT64_MAX - digit) / 10) {
+                        error("integer literal '" + num->value + "' is too large");
+                        return nullptr;
+                    }
+                    value = value * 10 + digit;
+                }
+                if (value <= static_cast<uint64_t>(INT32_MAX)) {
+                    outType = TypeInfo::intType(32, false);
+                    return llvm::ConstantInt::get(
+                        llvm::Type::getInt32Ty(context), value);
+                }
+                if (value <= static_cast<uint64_t>(INT64_MAX)) {
+                    outType = TypeInfo::intType(64, false);
+                    return llvm::ConstantInt::get(
+                        llvm::Type::getInt64Ty(context), value);
+                }
+                outType = TypeInfo::intType(64, true);
+                return llvm::ConstantInt::get(
+                    llvm::Type::getInt64Ty(context), value);
             }
             case NodeType::StringLit: {
                 auto* str = static_cast<const StringLiteral*>(node);
+                outType = TypeInfo::strType();
                 return builder->CreateGlobalString(str->value, "str_lit");
             }
             case NodeType::Variable: {
                 auto* var = static_cast<const Variable*>(node);
-                auto* c = lookupConst(var->name);
-                if (c) return c;
+                auto* constant = lookupConst(var->name);
+                if (constant) {
+                    outType = lookupConstType(var->name);
+                    return constant;
+                }
                 auto* alloca = lookupVar(var->name);
                 if (alloca) {
-                    auto* ty = alloca->getAllocatedType();
-                    if (ty->isArrayTy()) {
+                    outType = lookupVarType(var->name);
+                    if (outType.kind == TypeInfo::Array) {
                         error("array '" + var->name +
                               "' cannot be used as a value here; index it, "
                               "return it, or pass it to an array parameter");
                         return nullptr;
                     }
-                    return builder->CreateLoad(ty, alloca, var->name);
+                    return builder->CreateLoad(llvmTypeFor(outType), alloca,
+                                               var->name);
                 }
                 error("unknown variable '" + var->name + "'");
                 return nullptr;
@@ -873,25 +1439,30 @@ private:
             case NodeType::IndexExpr: {
                 auto* ix = static_cast<const IndexExpr*>(node);
 
-                // Array variables and array parameters are indexed directly.
                 if (ix->base->type == NodeType::Variable) {
                     auto* var = static_cast<const Variable*>(ix->base.get());
                     if (!lookupConst(var->name)) {
                         auto* alloca = lookupVar(var->name);
-                        if (alloca && alloca->getAllocatedType()->isArrayTy()) {
-                            llvm::Type* elemTy = nullptr;
-                            auto* ptr = compileLValue(node, &elemTy);
+                        TypeInfo varType = lookupVarType(var->name);
+                        if (alloca && varType.kind == TypeInfo::Array) {
+                            TypeInfo elemType;
+                            auto* ptr = compileLValue(node, elemType);
                             if (!ptr) return nullptr;
-                            return builder->CreateLoad(elemTy, ptr, "elem");
+                            outType = elemType;
+                            return builder->CreateLoad(
+                                llvmTypeFor(elemType), ptr, "elem");
                         }
                     }
                 }
 
                 auto* base = compileExpr(ix->base.get());
                 if (!base) return nullptr;
-                if (base->getType()->isPointerTy())
+                TypeInfo baseType = lastExprType;
+                if (baseType.kind == TypeInfo::Str) {
+                    outType = TypeInfo::strType();
                     return compileStringIndex(base, ix->index.get());
-                if (!base->getType()->isArrayTy()) {
+                }
+                if (baseType.kind != TypeInfo::Array || !baseType.elem) {
                     error("cannot index a value that is neither an array nor a string");
                     return nullptr;
                 }
@@ -903,7 +1474,7 @@ private:
                     return nullptr;
                 }
 
-                auto* arrTy = llvm::cast<llvm::ArrayType>(base->getType());
+                auto* arrTy = llvm::cast<llvm::ArrayType>(llvmTypeFor(baseType));
                 auto* tmp = builder->CreateAlloca(arrTy, nullptr, "array_value");
                 builder->CreateStore(base, tmp);
                 auto* ptr = builder->CreateInBoundsGEP(
@@ -911,40 +1482,54 @@ private:
                     {llvm::ConstantInt::get(llvm::Type::getInt32Ty(context), 0),
                      index},
                     "elem_ptr");
-                return builder->CreateLoad(
-                    arrTy->getArrayElementType(), ptr, "elem");
+                outType = *baseType.elem;
+                return builder->CreateLoad(llvmTypeFor(outType), ptr, "elem");
             }
-            case NodeType::ArrayLiteral: {
+            case NodeType::ArrayLiteral:
                 error("an array literal can only be used to initialize an array, "
                       "pass an array argument, or return an array value");
                 return nullptr;
-            }
             case NodeType::UnaryOp: {
-                auto* u = static_cast<const UnaryOp*>(node);
-                auto v = compileExpr(u->operand.get());
-                if (!v) return nullptr;
-                if (u->op == "-") {
-                    if (v->getType()->isIntegerTy()) {
-                        return builder->CreateNeg(v, "negtmp");
-                    } else if (v->getType()->isFloatingPointTy()) {
-                        return builder->CreateFNeg(v, "fnegtmp");
-                    } else {
-                        error("unary '-' cannot be applied to this type");
-                        return nullptr;
+                auto* unary = static_cast<const UnaryOp*>(node);
+                auto* operand = compileExpr(unary->operand.get());
+                if (!operand) return nullptr;
+                TypeInfo operandType = lastExprType;
+                if (unary->op == "-") {
+                    if (operandType.kind == TypeInfo::Int) {
+                        if (operandType.isUnsigned) {
+                            if (auto* constant =
+                                    llvm::dyn_cast<llvm::ConstantInt>(operand)) {
+                                llvm::APInt value = constant->getValue();
+                                if (value == llvm::APInt::getSignedMinValue(
+                                                 value.getBitWidth())) {
+                                    outType = TypeInfo::intType(
+                                        operandType.bits, false);
+                                    return constant;
+                                }
+                            }
+                        }
+                        outType = operandType;
+                        return builder->CreateNeg(operand, "negtmp");
                     }
+                    if (operandType.kind == TypeInfo::Float) {
+                        outType = operandType;
+                        return builder->CreateFNeg(operand, "fnegtmp");
+                    }
+                    error("unary '-' cannot be applied to this type");
+                    return nullptr;
                 }
-                error("unknown unary operator '" + u->op + "'");
+                error("unknown unary operator '" + unary->op + "'");
                 return nullptr;
             }
             case NodeType::BinaryOp: {
-                auto* bin = static_cast<const BinaryOp*>(node);
-                std::string op = bin->op;
+                auto* binary = static_cast<const BinaryOp*>(node);
+                std::string op = binary->op;
 
                 if (op == "&&" || op == "||") {
-                    auto left = compileExpr(bin->left.get());
+                    auto* left = compileExpr(binary->left.get());
                     if (!left) return nullptr;
-                    auto* lb = toBool(left);
-                    if (!lb) return nullptr;
+                    auto* leftBool = toBool(left);
+                    if (!leftBool) return nullptr;
                     llvm::BasicBlock* leftEndBB = builder->GetInsertBlock();
 
                     llvm::BasicBlock* rhsBB = llvm::BasicBlock::Create(
@@ -952,174 +1537,291 @@ private:
                     llvm::BasicBlock* endBB = llvm::BasicBlock::Create(
                         context, "logic_end", mainFunc);
                     if (op == "&&")
-                        builder->CreateCondBr(lb, rhsBB, endBB);
+                        builder->CreateCondBr(leftBool, rhsBB, endBB);
                     else
-                        builder->CreateCondBr(lb, endBB, rhsBB);
+                        builder->CreateCondBr(leftBool, endBB, rhsBB);
 
                     builder->SetInsertPoint(rhsBB);
-                    auto right = compileExpr(bin->right.get());
+                    auto* right = compileExpr(binary->right.get());
                     if (!right) return nullptr;
-                    auto* rb = toBool(right);
-                    if (!rb) return nullptr;
-                    auto* rhsVal = builder->CreateZExt(
-                        rb, llvm::Type::getInt32Ty(context), "logic_zext");
-                    auto* rhsEndBB = builder->GetInsertBlock();
+                    auto* rightBool = toBool(right);
+                    if (!rightBool) return nullptr;
+                    auto* rightValue = builder->CreateZExt(
+                        rightBool, llvm::Type::getInt32Ty(context),
+                        "logic_zext");
+                    auto* rightEndBB = builder->GetInsertBlock();
                     builder->CreateBr(endBB);
 
                     builder->SetInsertPoint(endBB);
                     auto* phi = builder->CreatePHI(
                         llvm::Type::getInt32Ty(context), 2, "logic_phi");
                     phi->addIncoming(
-                        llvm::ConstantInt::get(llvm::Type::getInt32Ty(context),
-                                               op == "&&" ? 0 : 1),
+                        llvm::ConstantInt::get(
+                            llvm::Type::getInt32Ty(context),
+                            op == "&&" ? 0 : 1),
                         leftEndBB);
-                    phi->addIncoming(rhsVal, rhsEndBB);
+                    phi->addIncoming(rightValue, rightEndBB);
+                    outType = TypeInfo::intType(32, false);
                     return phi;
                 }
 
-                auto left = compileExpr(bin->left.get());
-                auto right = compileExpr(bin->right.get());
+                auto* left = compileExpr(binary->left.get());
+                TypeInfo leftType = lastExprType;
+                auto* right = compileExpr(binary->right.get());
+                TypeInfo rightType = lastExprType;
                 if (!left || !right) return nullptr;
 
-                if (left->getType()->isArrayTy() ||
-                    right->getType()->isArrayTy()) {
+                if (leftType.kind == TypeInfo::Array ||
+                    rightType.kind == TypeInfo::Array) {
                     error("arrays cannot be used with operator '" + op + "'");
                     return nullptr;
                 }
 
-                bool leftIsPtr  = left->getType()->isPointerTy();
-                bool rightIsPtr = right->getType()->isPointerTy();
-
                 if (op == ">" || op == "<" || op == "==" || op == "!=" ||
                     op == ">=" || op == "<=") {
-                    if (leftIsPtr && rightIsPtr) {
-                        if (op == "==" || op == "!=") {
-                            auto* eq = callStrcmp(left, right);
-                            if (op == "!=") {
-                                eq = builder->CreateXor(eq,
-                                    llvm::ConstantInt::get(
-                                        llvm::Type::getInt32Ty(context), 1),
-                                    "cmpnot");
+                    if (leftType.kind == TypeInfo::Str ||
+                        rightType.kind == TypeInfo::Str) {
+                        if (leftType.kind == TypeInfo::Str &&
+                            rightType.kind == TypeInfo::Str) {
+                            if (op == "==" || op == "!=") {
+                                auto* equal = callStrcmp(left, right);
+                                if (op == "!=") {
+                                    equal = builder->CreateXor(
+                                        equal,
+                                        llvm::ConstantInt::get(
+                                            llvm::Type::getInt32Ty(context), 1),
+                                        "cmpnot");
+                                }
+                                outType = TypeInfo::intType(32, false);
+                                return equal;
                             }
-                            return eq;
+                            error("string comparison with '" + op +
+                                  "' is not allowed; use only == or !=");
+                            return nullptr;
                         }
-                        error("string comparison with '" + op +
-                              "' is not allowed; use only == or !=");
-                        return nullptr;
-                    }
-                    if (leftIsPtr || rightIsPtr) {
                         error("cannot compare a string with a non-string value");
                         return nullptr;
                     }
 
-                    llvm::Type* commonTy = commonNumericType(left, right);
-                    left  = convertValue(left, commonTy);
-                    right = convertValue(right, commonTy);
+                    TypeInfo commonType;
+                    std::string mergeError;
+                    if (!mergeNumericTypes(leftType, rightType, left, right,
+                                           commonType, mergeError)) {
+                        error(mergeError);
+                        return nullptr;
+                    }
+                    left = convertTyped(left, leftType, commonType, false,
+                                        "comparison");
+                    right = convertTyped(right, rightType, commonType, false,
+                                         "comparison");
 
                     llvm::Value* cmp = nullptr;
-                    if (commonTy->isIntegerTy()) {
-                        if (op == ">")  cmp = builder->CreateICmpSGT(left, right, "cmpgt");
-                        else if (op == "<")  cmp = builder->CreateICmpSLT(left, right, "cmplt");
-                        else if (op == "==") cmp = builder->CreateICmpEQ(left, right, "cmpeq");
-                        else if (op == "!=") cmp = builder->CreateICmpNE(left, right, "cmpne");
-                        else if (op == ">=") cmp = builder->CreateICmpSGE(left, right, "cmpge");
-                        else if (op == "<=") cmp = builder->CreateICmpSLE(left, right, "cmple");
+                    if (commonType.kind == TypeInfo::Int) {
+                        bool unsignedType = commonType.isUnsigned;
+                        if (op == ">")
+                            cmp = unsignedType
+                                ? builder->CreateICmpUGT(left, right, "cmpgt")
+                                : builder->CreateICmpSGT(left, right, "cmpgt");
+                        else if (op == "<")
+                            cmp = unsignedType
+                                ? builder->CreateICmpULT(left, right, "cmplt")
+                                : builder->CreateICmpSLT(left, right, "cmplt");
+                        else if (op == "==")
+                            cmp = builder->CreateICmpEQ(left, right, "cmpeq");
+                        else if (op == "!=")
+                            cmp = builder->CreateICmpNE(left, right, "cmpne");
+                        else if (op == ">=")
+                            cmp = unsignedType
+                                ? builder->CreateICmpUGE(left, right, "cmpge")
+                                : builder->CreateICmpSGE(left, right, "cmpge");
+                        else if (op == "<=")
+                            cmp = unsignedType
+                                ? builder->CreateICmpULE(left, right, "cmple")
+                                : builder->CreateICmpSLE(left, right, "cmple");
                     } else {
-                        if (op == ">")  cmp = builder->CreateFCmpOGT(left, right, "fcmpgt");
-                        else if (op == "<")  cmp = builder->CreateFCmpOLT(left, right, "fcmplt");
-                        else if (op == "==") cmp = builder->CreateFCmpOEQ(left, right, "fcmpeq");
-                        else if (op == "!=") cmp = builder->CreateFCmpONE(left, right, "fcmpne");
-                        else if (op == ">=") cmp = builder->CreateFCmpOGE(left, right, "fcmpge");
-                        else if (op == "<=") cmp = builder->CreateFCmpOLE(left, right, "fcmple");
+                        if (op == ">")
+                            cmp = builder->CreateFCmpOGT(left, right, "fcmpgt");
+                        else if (op == "<")
+                            cmp = builder->CreateFCmpOLT(left, right, "fcmplt");
+                        else if (op == "==")
+                            cmp = builder->CreateFCmpOEQ(left, right, "fcmpeq");
+                        else if (op == "!=")
+                            cmp = builder->CreateFCmpONE(left, right, "fcmpne");
+                        else if (op == ">=")
+                            cmp = builder->CreateFCmpOGE(left, right, "fcmpge");
+                        else if (op == "<=")
+                            cmp = builder->CreateFCmpOLE(left, right, "fcmple");
                     }
-                    return builder->CreateZExt(cmp,
-                        llvm::Type::getInt32Ty(context), "cmp_zext");
+                    outType = TypeInfo::intType(32, false);
+                    return builder->CreateZExt(
+                        cmp, llvm::Type::getInt32Ty(context), "cmp_zext");
                 }
 
-                if (leftIsPtr || rightIsPtr) {
-                    if (op == "+" && leftIsPtr && rightIsPtr)
+                if (leftType.kind == TypeInfo::Str ||
+                    rightType.kind == TypeInfo::Str) {
+                    if (op == "+" && leftType.kind == TypeInfo::Str &&
+                        rightType.kind == TypeInfo::Str) {
+                        outType = TypeInfo::strType();
                         return concatStrings(left, right);
+                    }
                     error("operator '" + op + "' cannot be applied to a string");
                     return nullptr;
                 }
 
-                llvm::Type* commonTy = commonNumericType(left, right);
-                left  = convertValue(left, commonTy);
-                right = convertValue(right, commonTy);
+                TypeInfo commonType;
+                std::string mergeError;
+                if (!mergeNumericTypes(leftType, rightType, left, right,
+                                       commonType, mergeError)) {
+                    error(mergeError);
+                    return nullptr;
+                }
+                left = convertTyped(left, leftType, commonType, false,
+                                    "arithmetic");
+                right = convertTyped(right, rightType, commonType, false,
+                                     "arithmetic");
+                outType = commonType;
 
-                if (op == "+") {
-                    return commonTy->isIntegerTy()
-                        ? builder->CreateAdd(left, right, "addtmp")
-                        : builder->CreateFAdd(left, right, "faddtmp");
-                } else if (op == "-") {
-                    return commonTy->isIntegerTy()
-                        ? builder->CreateSub(left, right, "subtmp")
-                        : builder->CreateFSub(left, right, "fsubtmp");
-                } else if (op == "*") {
-                    return commonTy->isIntegerTy()
-                        ? builder->CreateMul(left, right, "multmp")
-                        : builder->CreateFMul(left, right, "fmultmp");
-                } else if (op == "/") {
-                    return commonTy->isIntegerTy()
-                        ? builder->CreateSDiv(left, right, "divtmp")
-                        : builder->CreateFDiv(left, right, "fdivtmp");
+                if (commonType.kind == TypeInfo::Int) {
+                    if (op == "+") return builder->CreateAdd(left, right, "addtmp");
+                    if (op == "-") return builder->CreateSub(left, right, "subtmp");
+                    if (op == "*") return builder->CreateMul(left, right, "multmp");
+                    if (op == "/")
+                        return commonType.isUnsigned
+                            ? builder->CreateUDiv(left, right, "divtmp")
+                            : builder->CreateSDiv(left, right, "divtmp");
+                } else if (commonType.kind == TypeInfo::Float) {
+                    if (op == "+") return builder->CreateFAdd(left, right, "faddtmp");
+                    if (op == "-") return builder->CreateFSub(left, right, "fsubtmp");
+                    if (op == "*") return builder->CreateFMul(left, right, "fmultmp");
+                    if (op == "/") return builder->CreateFDiv(left, right, "fdivtmp");
                 }
                 return nullptr;
             }
             case NodeType::Call: {
                 auto* call = static_cast<const Call*>(node);
-                if (call->name == "input") return compileInput(call);
+                if (call->name == "input") {
+                    outType = TypeInfo::strType();
+                    return compileInput(call);
+                }
                 if (call->name == "str") {
                     if (call->args.size() != 1) {
                         error("str() expects one argument");
                         return nullptr;
                     }
-                    auto arg = compileExpr(call->args[0].get());
+                    auto* arg = compileExpr(call->args[0].get());
                     if (!arg) return nullptr;
-                    return compileStr(arg);
+                    TypeInfo argType = lastExprType;
+                    outType = TypeInfo::strType();
+                    return compileStr(arg, argType);
                 }
-                if (call->name == "int")   return compileInt(call);
-                if (call->name == "float") return compileFloat(call);
+                if (call->name == "int") {
+                    outType = TypeInfo::intType(conversionWidth(call, 32), false);
+                    return compileIntegerConversion(call, false);
+                }
+                if (call->name == "uint") {
+                    outType = TypeInfo::intType(conversionWidth(call, 32), true);
+                    return compileIntegerConversion(call, true);
+                }
+                if (call->name == "float") {
+                    outType = TypeInfo::floatType(conversionWidth(call, 64));
+                    return compileFloat(call);
+                }
 
                 auto* fn = module->getFunction(call->name);
                 if (!fn) {
                     error("unknown function '" + call->name + "'");
                     return nullptr;
                 }
+                TypeInfo returnType = TypeInfo::voidType();
+                auto returnIt = functionReturnTypes.find(call->name);
+                if (returnIt != functionReturnTypes.end())
+                    returnType = returnIt->second;
+
+                auto paramsIt = functionParamTypes.find(call->name);
                 if (call->args.size() != fn->arg_size()) {
                     error("function '" + call->name + "' expects " +
-                          std::to_string(fn->arg_size()) + " argument(s), got " +
+                          std::to_string(fn->arg_size()) +
+                          " argument(s), got " +
                           std::to_string(call->args.size()));
                     return nullptr;
                 }
                 std::vector<llvm::Value*> args;
                 for (size_t i = 0; i < call->args.size(); ++i) {
-                    auto* pty = fn->getFunctionType()->getParamType(i);
+                    TypeInfo paramType;
+                    if (paramsIt != functionParamTypes.end() &&
+                        i < paramsIt->second.size())
+                        paramType = paramsIt->second[i];
                     std::string where = "argument " + std::to_string(i + 1) +
                                         " of function '" + call->name + "'";
-                    llvm::Value* v = nullptr;
-                    if (pty->isArrayTy()) {
-                        v = compileArrayValue(call->args[i].get(), pty, where);
+                    llvm::Value* value = nullptr;
+                    if (paramType.kind == TypeInfo::Array) {
+                        value = compileArrayValue(call->args[i].get(),
+                                                  paramType, where);
                     } else {
-                        v = compileExpr(call->args[i].get());
-                        if (v && v->getType()->isArrayTy()) {
-                            error(where + " is an array, but the parameter is "
-                                  "not an array");
-                            return nullptr;
+                        value = compileExpr(call->args[i].get());
+                        if (value) {
+                            TypeInfo argType = lastExprType;
+                            if (argType.kind == TypeInfo::Array) {
+                                error(where + " is an array, but the parameter is "
+                                      "not an array");
+                                return nullptr;
+                            }
+                            value = convertTyped(value, argType, paramType,
+                                                 false, where);
+                            if (value &&
+                                value->getType() != llvmTypeFor(paramType))
+                                return nullptr;
                         }
-                        if (v && v->getType() != pty) v = convertValue(v, pty);
                     }
-                    if (!v) return nullptr;
-                    args.push_back(v);
+                    if (!value) return nullptr;
+                    args.push_back(value);
                 }
-                if (fn->getReturnType()->isVoidTy()) {
+                outType = returnType;
+                if (returnType.kind == TypeInfo::Void)
                     return builder->CreateCall(fn, args);
-                }
                 return builder->CreateCall(fn, args, "calltmp");
             }
             default:
                 return nullptr;
         }
+    }
+    void emitPrintValue(llvm::Value* value, const TypeInfo& type) {
+        std::string format;
+        if (type.kind == TypeInfo::Int) {
+            if (type.bits > 64) {
+                format = "%s";
+                value = compileStr(value, type);
+            } else {
+                format = type.isUnsigned ? "%llu" : "%lld";
+                if (type.bits < 64) {
+                    value = type.isUnsigned
+                        ? builder->CreateZExt(
+                              value, llvm::Type::getInt64Ty(context))
+                        : builder->CreateSExt(
+                              value, llvm::Type::getInt64Ty(context));
+                }
+            }
+        } else if (type.kind == TypeInfo::Float) {
+            format = "%f";
+            if (type.bits == 16 || type.bits == 32)
+                value = builder->CreateFPExt(
+                    value, llvm::Type::getDoubleTy(context));
+            else if (type.bits == 128)
+                value = builder->CreateFPTrunc(
+                    value, llvm::Type::getDoubleTy(context));
+        } else if (type.kind == TypeInfo::Str) {
+            format = "%s";
+        } else if (type.kind == TypeInfo::Array) {
+            error("print() cannot print an array");
+            return;
+        } else {
+            error("print() cannot print this value");
+            return;
+        }
+
+        auto* formatString = builder->CreateGlobalString(format, "printf_fmt");
+        builder->CreateCall(module->getFunction("printf"),
+                            {formatString, value});
     }
 
     void compileStmt(const ASTNode* stmt) {
@@ -1134,37 +1836,45 @@ private:
                     break;
                 }
 
-                if (currentReturnType == "void") {
+                if (currentReturnInfo.kind == TypeInfo::Void) {
                     if (rs->value) {
                         error("'return' with a value inside a void function");
                     }
                     builder->CreateRetVoid();
                 } else {
-                    llvm::Type* retTy = mapType(currentReturnType);
+                    llvm::Value* value = nullptr;
                     if (!rs->value) {
                         error("'return' without a value inside a non-void function");
-                        addDefaultReturn(currentReturnType);
                     } else {
-                        llvm::Value* v = nullptr;
-                        if (retTy->isArrayTy()) {
-                            std::string where = "return value of function '" +
-                                                mainFunc->getName().str() + "'";
-                            v = compileArrayValue(rs->value.get(), retTy, where);
+                        std::string where = "return value of function '" +
+                                            mainFunc->getName().str() + "'";
+                        if (currentReturnInfo.kind == TypeInfo::Array) {
+                            value = compileArrayValue(rs->value.get(),
+                                                      currentReturnInfo, where);
                         } else {
-                            v = compileExpr(rs->value.get());
-                            if (v && v->getType()->isArrayTy()) {
-                                error("cannot return an array from a function "
-                                      "returning '" + currentReturnType + "'");
-                                v = nullptr;
-                            } else if (v) {
-                                v = convertValue(v, retTy);
+                            value = compileExpr(rs->value.get());
+                            if (value) {
+                                TypeInfo valueType = lastExprType;
+                                if (valueType.kind == TypeInfo::Void) {
+                                    error("cannot return a void value");
+                                    value = nullptr;
+                                } else if (valueType.kind == TypeInfo::Array) {
+                                    error("cannot return an array from a function "
+                                          "returning '" +
+                                          currentReturnInfo.name() + "'");
+                                    value = nullptr;
+                                } else {
+                                    value = convertTyped(value, valueType,
+                                                         currentReturnInfo, false,
+                                                         where);
+                                }
                             }
                         }
-                        if (!v) {
-                            addDefaultReturn(currentReturnType);
-                        } else {
-                            builder->CreateRet(v);
-                        }
+                    }
+                    if (!value) {
+                        addDefaultReturn(currentReturnType);
+                    } else {
+                        builder->CreateRet(value);
                     }
                 }
                 {
@@ -1177,102 +1887,125 @@ private:
 
             case NodeType::VarDecl: {
                 auto* vd = static_cast<const VarDecl*>(stmt);
-                llvm::Type* ty = nullptr;
+                TypeInfo declared;
+                bool hasDeclared = !vd->type.empty();
+                if (hasDeclared) {
+                    std::string parseError;
+                    if (!parseTypeInfo(vd->type, declared, parseError)) {
+                        error(parseError);
+                        hasDeclared = false;
+                    }
+                }
+
                 llvm::Value* initVal = nullptr;
                 bool initFailed = false;
 
-                if (!vd->type.empty()) ty = mapType(vd->type);
-
                 if (vd->init && vd->init->type == NodeType::ArrayLiteral) {
                     auto* lit = static_cast<const ArrayLiteral*>(vd->init.get());
-                    if (ty && !ty->isArrayTy()) {
-                        error("variable '" + vd->name + "' of type '" + vd->type +
+                    if (hasDeclared && declared.kind != TypeInfo::Array) {
+                        error("variable '" + vd->name + "' of type '" +
+                              vd->type +
                               "' cannot be initialized with an array literal");
                         initFailed = true;
-                    } else if (lit->elements.empty()) {
-                        error("array literal for '" + vd->name + "' cannot be empty");
-                        initFailed = true;
-                    } else if (ty && lit->elements.size() !=
-                                     ty->getArrayNumElements()) {
-                        error("array '" + vd->name + "' expects " +
-                              std::to_string(ty->getArrayNumElements()) +
-                              " element(s), but the initializer has " +
-                              std::to_string(lit->elements.size()));
-                        initFailed = true;
-                    } else if (!ty) {
-                        llvm::Type* elemTy = nullptr;
-                        for (auto& e : lit->elements) {
-                            auto v = compileExpr(e.get());
-                            if (!v) { initFailed = true; break; }
-                            if (v->getType()->isVoidTy()) {
-                                error("invalid element in the initializer of '" +
-                                      vd->name + "'");
-                                initFailed = true;
-                                break;
-                            }
-                            auto* merged = mergeElementType(elemTy, v->getType());
-                            if (!merged) {
-                                error("array literal for '" + vd->name +
-                                      "' mixes strings and numbers");
-                                initFailed = true;
-                                break;
-                            }
-                            elemTy = merged;
-                        }
-                        if (!initFailed) {
-                            ty = llvm::ArrayType::get(elemTy,
-                                                      lit->elements.size());
-                        }
-                    }
-                    if (!initFailed) {
-                        initVal = buildArrayInitializer(lit, ty, vd->name, initFailed);
-                    }
-                } else if (vd->init) {
-                    if (ty && ty->isArrayTy()) {
-                        if (vd->init->type != NodeType::Call) {
-                            error("array '" + vd->name +
-                                  "' must be initialized with an array literal "
-                                  "or a function call returning an array");
+                    } else {
+                        std::vector<llvm::Value*> values;
+                        std::vector<TypeInfo> types;
+                        if (!compileArrayElements(
+                                lit, "array '" + vd->name + "'", values, types)) {
                             initFailed = true;
                         } else {
-                            initVal = compileArrayValue(
-                                vd->init.get(), ty,
-                                "initializer of array '" + vd->name + "'");
-                            if (!initVal) initFailed = true;
+                            TypeInfo arrayType;
+                            if (hasDeclared) {
+                                if (lit->elements.size() != declared.count) {
+                                    error("array '" + vd->name + "' expects " +
+                                          std::to_string(declared.count) +
+                                          " element(s), but the initializer has " +
+                                          std::to_string(lit->elements.size()));
+                                    initFailed = true;
+                                } else {
+                                    arrayType = declared;
+                                }
+                            } else {
+                                bool ok = false;
+                                TypeInfo elem = inferArrayElementType(
+                                    values, types, "array '" + vd->name + "'",
+                                    ok);
+                                if (!ok) {
+                                    initFailed = true;
+                                } else {
+                                    arrayType = TypeInfo::arrayType(
+                                        elem,
+                                        static_cast<unsigned>(lit->elements.size()));
+                                }
+                            }
+                            if (!initFailed) {
+                                initVal = buildArrayFromValues(
+                                    values, types, arrayType,
+                                    "array '" + vd->name + "'", initFailed);
+                                if (!initFailed) {
+                                    declared = arrayType;
+                                    hasDeclared = true;
+                                }
+                            }
                         }
+                    }
+                } else if (vd->init) {
+                    if (hasDeclared && declared.kind == TypeInfo::Array) {
+                        initVal = compileArrayValue(
+                            vd->init.get(), declared,
+                            "initializer of array '" + vd->name + "'");
+                        if (!initVal) initFailed = true;
                     } else {
                         initVal = compileExpr(vd->init.get());
                         if (!initVal) {
                             initFailed = true;
-                        } else if (initVal->getType()->isVoidTy()) {
-                            error("variable '" + vd->name +
-                                  "' cannot be initialized with a void value");
-                            initVal = nullptr;
-                            initFailed = true;
-                        } else if (initVal->getType()->isArrayTy() && ty) {
-                            error("variable '" + vd->name + "' of type '" +
-                                  vd->type +
-                                  "' cannot be initialized with an array value");
-                            initVal = nullptr;
-                            initFailed = true;
-                        } else if (vd->type.empty()) {
-                            ty = initVal->getType();
+                        } else {
+                            TypeInfo initType = lastExprType;
+                            if (initType.kind == TypeInfo::Void) {
+                                error("variable '" + vd->name +
+                                      "' cannot be initialized with a void value");
+                                initVal = nullptr;
+                                initFailed = true;
+                            } else if (initType.kind == TypeInfo::Array) {
+                                if (!hasDeclared) {
+                                    declared = initType;
+                                    hasDeclared = true;
+                                } else {
+                                    error("variable '" + vd->name +
+                                          "' of type '" + declared.name() +
+                                          "' cannot be initialized with an array "
+                                          "value");
+                                    initVal = nullptr;
+                                    initFailed = true;
+                                }
+                            } else if (!hasDeclared) {
+                                declared = initType;
+                                hasDeclared = true;
+                            } else {
+                                initVal = convertTyped(
+                                    initVal, initType, declared, false,
+                                    "initializer of variable '" + vd->name + "'");
+                            }
                         }
                     }
                 }
 
-                if (!ty) ty = llvm::Type::getInt32Ty(context);
-                if (ty->isVoidTy()) {
+                if (!hasDeclared) {
+                    declared = TypeInfo::intType(32, false);
+                    hasDeclared = true;
+                }
+                if (declared.kind == TypeInfo::Void) {
                     error("variable '" + vd->name + "' cannot be of type void");
-                    ty = llvm::Type::getInt32Ty(context);
+                    declared = TypeInfo::intType(32, false);
                 }
 
+                llvm::Type* ty = llvmTypeFor(declared);
                 auto* alloca = builder->CreateAlloca(ty, nullptr, vd->name);
-                declareVar(vd->name, alloca);
+                declareVar(vd->name, alloca, declared);
 
                 if (initVal) {
-                    if (initVal->getType() != ty) initVal = convertValue(initVal, ty);
-                    builder->CreateStore(initVal, alloca);
+                    if (initVal->getType() == ty)
+                        builder->CreateStore(initVal, alloca);
                 } else if (!initFailed) {
                     storeDefaultValue(alloca, ty);
                 }
@@ -1285,23 +2018,38 @@ private:
                     error("constant arrays are not supported");
                     break;
                 }
-                auto val = compileExpr(cd->init.get());
+                if (!cd->init) break;
+                auto* val = compileExpr(cd->init.get());
                 if (!val) break;
                 if (!llvm::isa<llvm::Constant>(val)) {
                     error("initializer for constant '" + cd->name +
                           "' is not a constant expression");
                     break;
                 }
+                TypeInfo valueType = lastExprType;
+                if (valueType.kind == TypeInfo::Void ||
+                    valueType.kind == TypeInfo::Array) {
+                    error("constant '" + cd->name +
+                          "' has an invalid type");
+                    break;
+                }
                 auto* c = llvm::cast<llvm::Constant>(val);
                 if (!cd->type.empty()) {
-                    llvm::Type* ty = mapType(cd->type);
-                    if (ty->isVoidTy()) {
-                        error("constant '" + cd->name + "' cannot be of type void");
+                    TypeInfo declared;
+                    std::string parseError;
+                    if (!parseTypeInfo(cd->type, declared, parseError)) {
+                        error(parseError);
                         break;
                     }
-                    c = convertConstant(c, ty, cd->name);
+                    if (declared.kind == TypeInfo::Void) {
+                        error("constant '" + cd->name +
+                              "' cannot be of type void");
+                        break;
+                    }
+                    c = convertConstantTyped(c, valueType, declared, cd->name);
+                    valueType = declared;
                 }
-                declareConst(cd->name, c);
+                declareConst(cd->name, c, valueType);
                 break;
             }
 
@@ -1314,38 +2062,41 @@ private:
                     break;
                 }
 
-                llvm::Type* targetTy = nullptr;
+                TypeInfo targetType;
                 llvm::Value* targetPtr = nullptr;
                 if (as->target) {
-                    targetPtr = compileLValue(as->target.get(), &targetTy);
+                    targetPtr = compileLValue(as->target.get(), targetType);
                 } else {
                     auto* alloca = lookupVar(as->name);
                     if (!alloca) {
                         error("unknown variable '" + as->name + "'");
                         break;
                     }
-                    targetTy = alloca->getAllocatedType();
-                    if (targetTy->isArrayTy()) {
-                        error("cannot assign to array '" + as->name +
-                              "' as a whole; assign one element instead");
-                        break;
-                    }
+                    targetType = lookupVarType(as->name);
                     targetPtr = alloca;
                 }
                 if (!targetPtr) break;
 
-                auto val = compileExpr(as->value.get());
+                if (targetType.kind == TypeInfo::Array) {
+                    error("cannot assign to array '" + name +
+                          "' as a whole; assign one element instead");
+                    break;
+                }
+
+                auto* val = compileExpr(as->value.get());
                 if (val) {
-                    if (val->getType()->isVoidTy()) {
+                    TypeInfo valueType = lastExprType;
+                    if (valueType.kind == TypeInfo::Void) {
                         error("cannot assign a void value to '" + name + "'");
                         break;
                     }
-                    if (val->getType()->isArrayTy()) {
+                    if (valueType.kind == TypeInfo::Array) {
                         error("cannot assign an array value to '" + name +
                               "'; assign one element instead");
                         break;
                     }
-                    if (val->getType() != targetTy) val = convertValue(val, targetTy);
+                    val = convertTyped(val, valueType, targetType, false,
+                                       "assignment to '" + name + "'");
                     builder->CreateStore(val, targetPtr);
                 }
                 break;
@@ -1355,47 +2106,24 @@ private:
                 auto* ps = static_cast<const PrintStmt*>(stmt);
                 size_t n = ps->args.size();
                 for (size_t i = 0; i < n; ++i) {
-                    auto val = compileExpr(ps->args[i].get());
+                    auto* val = compileExpr(ps->args[i].get());
                     if (!val) continue;
-                    std::string format;
-                    if (val->getType()->isVoidTy()) {
-                        error("print() cannot print a void value");
-                        continue;
-                    } else if (val->getType()->isIntegerTy()) {
-                        if (val->getType()->getIntegerBitWidth() == 64)
-                            format = "%lld";
-                        else
-                            format = "%d";
-                    } else if (val->getType()->isFloatingPointTy()) {
-                        if (val->getType()->isFloatTy())
-                            val = builder->CreateFPExt(
-                                val, llvm::Type::getDoubleTy(context));
-                        format = "%f";
-                    } else if (val->getType()->isPointerTy()) {
-                        format = "%s";
-                    } else if (val->getType()->isArrayTy()) {
-                        error("print() cannot print an array");
-                        continue;
-                    } else {
-                        format = "%p";
-                    }
-
-                    auto formatStr = builder->CreateGlobalString(format, "printf_fmt");
-                    builder->CreateCall(module->getFunction("printf"), {formatStr, val});
-
+                    TypeInfo type = lastExprType;
+                    emitPrintValue(val, type);
                     if (i != n - 1) {
-                        auto space = builder->CreateGlobalString(" ", "space");
-                        builder->CreateCall(module->getFunction("printf"), {space});
+                        auto* space = builder->CreateGlobalString(" ", "space");
+                        builder->CreateCall(module->getFunction("printf"),
+                                            {space});
                     }
                 }
-                auto newline = builder->CreateGlobalString("\n", "newline");
+                auto* newline = builder->CreateGlobalString("\n", "newline");
                 builder->CreateCall(module->getFunction("printf"), {newline});
                 break;
             }
 
             case NodeType::IfStmt: {
                 auto* ifs = static_cast<const IfStmt*>(stmt);
-                auto condVal = compileExpr(ifs->condition.get());
+                auto* condVal = compileExpr(ifs->condition.get());
                 if (!condVal) break;
                 llvm::Value* condBool = toBool(condVal);
                 if (!condBool) break;
@@ -1446,7 +2174,7 @@ private:
                 builder->CreateBr(condBB);
 
                 builder->SetInsertPoint(condBB);
-                auto condVal = compileExpr(ws->condition.get());
+                auto* condVal = compileExpr(ws->condition.get());
                 if (!condVal) {
                     loopStack.pop_back();
                     break;

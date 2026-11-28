@@ -26,3 +26,21 @@ print("x =", x, "y =", y, "z =", z)
 // Mixing with arithmetic
 var result = int(3.14) + 5
 print("int(3.14) + 5 =", result)
+
+// Explicit widths and signedness
+var small = int(300, 8)                    // 44
+var byte = uint(-1, 8)                     // 255
+var tricky = int(7, 3)                     // -1
+var big = int(18446744073709551615, 128)   // 18446744073709551615
+print("int(300, 8) =", small)
+print("uint(-1, 8) =", byte)
+print("int(7, 3) =", tricky)
+print("int(18446744073709551615, 128) =", big)
+
+var single = float(1.0 / 3.0, 32)
+var quad = float(2.25, 128)
+print("float(1/3, 32) =", single)
+print("float(2.25, 128) =", quad)
+
+// str() works for every integer width.
+print("str(big) =", str(big))

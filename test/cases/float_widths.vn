@@ -1,0 +1,11 @@
+var a : f16 = float(1.5, 16)
+var b : f32 = float(2.25, 32)
+var c : f64 = 3.125
+var d : f128 = float(4.5, 128)
+print(a, b, c, d)
+print(a + b)
+print(b + c)
+print(c + d)
+
+var third : f32 = 1.0 / 3.0
+print(third)

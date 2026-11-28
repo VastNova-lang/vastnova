@@ -1,0 +1,3 @@
+fn work() {
+    return 1
+}

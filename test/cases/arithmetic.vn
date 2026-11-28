@@ -1,0 +1,20 @@
+var a = 10 + 5 * 2
+print(a)
+print((10 + 5) * 2)
+print(20 / 3)
+print(-20 / 3)
+print(-(3 + 4))
+
+var x = -5
+print(-x)
+print(-x * 2)
+
+print(3.14 * 2)
+print(1 + 0.5)
+print("Hello" + " " + "World")
+print(7 / 2, 7.0 / 2.0)
+
+var small : i3 = 3
+var tiny : u3 = 7
+print(small + 1)
+print(tiny + 1)

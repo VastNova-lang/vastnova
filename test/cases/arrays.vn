@@ -1,0 +1,21 @@
+var zeros : i32[3]
+print(zeros[0], zeros[1], zeros[2])
+
+var a : i32[5] = [1, 2, 3, 4, 5]
+a[0] = 10
+print(a[0], a[4])
+
+var inferred = [1, 2, 3]
+print(inferred[0] + inferred[1] + inferred[2])
+
+var floats = [1.0, 2.5]
+print(floats[0] + floats[1])
+
+var names : str[3] = ["a", "b", "c"]
+print(names[0] + names[2])
+
+var tiny : i3[2] = [3, 1]
+print(tiny[0] + tiny[1])
+
+var bytes : u8[2] = [200, 100]
+print(bytes[0] + bytes[1])

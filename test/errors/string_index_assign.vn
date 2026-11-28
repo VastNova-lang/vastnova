@@ -1,0 +1,2 @@
+var text = "abc"
+text[0] = "x"

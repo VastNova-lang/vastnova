@@ -1,0 +1,75 @@
+fn greet() {
+    print("Hello!")
+}
+
+fn add(a : i32, b : i32) -> i32 {
+    return a + b
+}
+
+fn square(x : f64) -> f64 {
+    return x * x
+}
+
+fn fib(n : i32) -> i32 {
+    if n < 2 {
+        return n
+    }
+    return fib(n - 1) + fib(n - 2)
+}
+
+fn factorial(n : i32) -> i32 {
+    var result = 1
+    while n > 1 {
+        result = result * n
+        n = n - 1
+    }
+    return result
+}
+
+fn total(values : i32[3]) -> i32 {
+    return values[0] + values[1] + values[2]
+}
+
+fn make_values() -> i32[3] {
+    return [1, 2, 3]
+}
+
+fn half(value : i32) -> f64 {
+    return value / 2.0
+}
+
+greet()
+print(add(3, 4))
+print(square(2.5))
+print(fib(10))
+print(factorial(5))
+print(total([10, 20, 30]))
+
+var values = make_values()
+print(values[0], values[1], values[2])
+print(make_values()[1])
+print(half(5))
+
+fn early(flag : i32) {
+    if flag {
+        return
+    }
+    print("no early return")
+}
+
+fn as_float(value : i32) -> f64 {
+    return value
+}
+
+fn call_later() -> i32 {
+    return later()
+}
+
+fn later() -> i32 {
+    return 9
+}
+
+early(1)
+early(0)
+print(as_float(3))
+print(call_later())

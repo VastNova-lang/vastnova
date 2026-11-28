@@ -42,6 +42,26 @@ Hello, World!
 
 For more examples, see the [examples/](examples/) directory.
 
+### Run Tests
+Build the compiler first, then run the test script:
+
+```bash
+./build.sh
+sh test/run_tests.sh
+```
+
+The script runs the programs in `test/cases/` and compares their output with the
+matching `.expected` files. The cases cover variables and scope, arithmetic,
+comparisons and logic, control flow, functions and recursion, arrays, strings and
+escapes, `input`, imports, comments, arbitrary integer widths, and all four
+float formats. A case with a matching `.stdin` file receives that file on
+standard input.
+
+The programs in `test/errors/` must fail with the diagnostic listed in the
+matching `.error` file. All intermediate files are written under `test/temp/`,
+which is ignored by git and cleaned after each run. Pass a compiler path as the
+first argument or set `VASTNOVA` to test a different build.
+
 ## Documentation
 
 For language syntax, compiler internals, and contribution guidelines, see the [language reference](Docs/docs.md).
